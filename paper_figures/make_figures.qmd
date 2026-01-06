@@ -1,0 +1,2994 @@
+---
+title: "Single-cell RNA-seq Analysis: GFP+ Blood Cells"
+author: "Almog Angel"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: united
+  pdf_document: default
+date: "`r Sys.Date()`"
+---
+
+# Overview
+
+This document performs single-cell RNA-seq analysis on mouse blood samples 
+comparing GFP+ experimental conditions to control. The analysis includes:
+
+- Quality control and filtering
+- Normalization and integration
+- Dimensionality reduction and clustering
+- Cell type annotation
+- Differential expression analysis
+
+# Setup
+
+## Load packages and set environment
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load required packages
+library(Seurat)        # scRNA-seq analysis framework
+library(tidyverse)     # Data manipulation and visualization
+library(SingleR)       # Automated cell type annotation
+library(dittoSeq)      # Color-blind friendly visualization
+library(ggrepel)       # Label positioning in plots
+library(scDblFinder)   # Doublet detection
+library(mascarade)     # Additional visualization tools
+library(ggnewscale)    # Multiple color scales in ggplot2
+library(patchwork)     # Combine multiple plots
+library(msigdbr)
+library(UCell)
+library(tidytext)
+
+# Set reproducibility seed
+set.seed(123)
+
+# Define base directory (modify this path for your system)
+base_dir <- "/bigdata/sequencing/milk/"
+if (!dir.exists(base_dir)) {
+  stop("Base directory does not exist: ", base_dir)
+}
+setwd(base_dir)
+
+# Initialize biomaRt connection for gene annotation
+mouse <- biomaRt::useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+# Color palette for visualizations (color-blind friendly where possible)
+colors <- c("#00F5FF", "#008B00", "#F0E442", "#D55E00", "pink", "red", 
+            "#00F6B3", "#551A8B", "#00446B", "#803800", "#666666", 
+            "#7FFF00", "#FFDAB9", "orange", "#2e0014", "#650115", 
+            "#EE7AE9", "#8DB6CD", "black", "blue", "gray")
+```
+
+## Helper functions
+
+```{r helper_fun, message=FALSE, warning=FALSE}
+#' Merge multiple EGFP gene entries into single feature
+#' 
+#' @description
+#' Some datasets may have multiple EGFP entries (e.g., EGFP, EGFP-P2A).
+#' This function identifies all EGFP-related features, combines their counts,
+#' and creates a single "EGFP" feature for downstream analysis.
+#' 
+#' @param obj Count matrix (genes x cells)
+#' @return Count matrix with merged EGFP counts
+#' 
+#' @details
+#' - Identifies features containing "EGFP" in name
+#' - Sums counts across all EGFP features per cell
+#' - Removes original EGFP features and adds combined feature
+#' - Prints diagnostic information about EGFP detection
+mergeEGFP <- function(obj) {
+  egfp_idx <- grepl("EGFP", rownames(obj), ignore.case = TRUE)
+  
+  if (!any(egfp_idx)) {
+    message("No EGFP features detected in this sample")
+    return(obj)
+  }
+  
+  egfp_cells <- names(which(colSums(obj[egfp_idx, , drop = FALSE]) > 0))
+  
+  message(paste0("EGFP features found: ", paste(rownames(obj)[egfp_idx], collapse = ", ")))
+  message(paste0("Number of EGFP+ cells: ", length(egfp_cells)))
+  message(paste0("Total EGFP UMI counts: ", sum(obj[egfp_idx, ])))
+  
+  # Combine all EGFP counts
+  egfp_combined <- colSums(obj[egfp_idx, , drop = FALSE])
+  obj <- obj[!egfp_idx, , drop = FALSE]
+  obj <- rbind(egfp_combined, obj)
+  rownames(obj)[1] <- "EGFP"
+  
+  return(obj)
+}
+#' Convert Ensembl gene IDs to MGI gene symbols
+#' 
+#' @description
+#' Converts Ensembl gene IDs to mouse gene symbols using biomaRt.
+#' Handles duplicate symbols by summing their counts.
+#' 
+#' @param obj Count matrix with Ensembl IDs as rownames
+#' @return Count matrix with gene symbols as rownames
+#' 
+#' @details
+#' - Queries biomaRt for gene symbol mappings
+#' - Removes genes without symbols
+#' - Preserves EGFP feature
+#' - Aggregates counts for duplicate gene symbols
+#' - Filters out genes with zero counts across all cells
+#' 
+#' @note This function requires the 'mouse' biomaRt object in the environment
+ensembl2symbol <- function(obj) {
+  ensembl_ids <- rownames(obj)
+  
+  # Special handling for EGFP (not in Ensembl)
+  is_egfp <- ensembl_ids == "EGFP"
+  ensembl_to_query <- ensembl_ids[!is_egfp]
+  
+  message("Querying biomaRt for gene symbols...")
+  gene_info <- biomaRt::getBM(
+    attributes = c('ensembl_gene_id', 'mgi_symbol'),
+    filters = 'ensembl_gene_id',
+    values = ensembl_to_query,
+    mart = mouse
+  )
+  
+  # Remove entries without gene symbols
+  gene_info <- gene_info |>
+    filter(mgi_symbol != "")
+  
+  # Add EGFP back if present
+  if (any(is_egfp)) {
+    gene_info <- rbind(data.frame(ensembl_gene_id = "EGFP", mgi_symbol = "EGFP"), 
+                       gene_info)
+  }
+  
+  # Report mapping statistics
+  n_mapped <- length(unique(gene_info$ensembl_gene_id))
+  n_total <- length(ensembl_ids)
+  message(sprintf("Mapped %d/%d features (%.1f%%)", n_mapped, n_total, 
+                  100 * n_mapped / n_total))
+  
+  # Keep only mapped genes
+  obj <- obj[gene_info$ensembl_gene_id, , drop = FALSE]
+  rownames(obj) <- gene_info$mgi_symbol
+  
+  # Filter out genes with zero counts (optional, improves memory)
+  genes_expressed <- rowSums(obj) > 0
+  obj <- obj[genes_expressed, , drop = FALSE]
+  message(sprintf("Retained %d genes with non-zero counts", sum(genes_expressed)))
+  
+  # Aggregate counts for duplicated symbols (sum counts)
+  obj_aggregated <- rowsum(obj, group = rownames(obj))
+  
+  n_duplicates <- nrow(obj) - nrow(obj_aggregated)
+  if (n_duplicates > 0) {
+    message(sprintf("Aggregated %d duplicate gene symbols", n_duplicates))
+  }
+  
+  return(obj_aggregated)
+}
+```
+
+# Data Loading
+
+## Load and pre-process samples
+
+```{r load, message=FALSE, warning=FALSE}
+# Define sample paths
+sample_paths <- list(
+  mar25_gfp = "Chen_Dvir_30mar25/puppies_blood_1/outs/per_sample_outs/puppies_blood/count/sample_filtered_feature_bc_matrix.h5",
+  aug25_gfp = "DvirAran_Zinger_10x/puppies_gfp/outs/per_sample_outs/puppies_gfp/count/sample_filtered_feature_bc_matrix.h5",
+  aug25_ctl = "DvirAran_260825/puppies_control2/outs/per_sample_outs/puppies_control2/count/sample_filtered_feature_bc_matrix.h5"
+)
+
+# Minimum features per cell for initial filtering
+# Cells with fewer detected genes are likely empty droplets or low-quality
+MIN_FEATURES <- 200
+
+message("=== Loading Sample 1: mar25_gfp ===")
+mar25 <- Read10X_h5(sample_paths$mar25_gfp)
+mar25 <- mergeEGFP(mar25)
+mar25 <- ensembl2symbol(mar25)
+message(sprintf("Dimensions: %d genes × %d cells", nrow(mar25), ncol(mar25)))
+mar25.srt <- CreateSeuratObject(
+  counts = mar25, 
+  project = "gfp1", 
+  min.cells = 3,        # Keep genes detected in ≥3 cells
+  min.features = MIN_FEATURES
+)
+mar25.srt$sample <- "mar25_gfp"
+mar25.srt$condition <- "GFP"
+mar25.srt$batch <- "March2025"
+message(sprintf("Seurat object: %d cells retained\n", ncol(mar25.srt)))
+
+message("=== Loading Sample 2: aug25_gfp ===")
+aug25 <- Read10X_h5(sample_paths$aug25_gfp)
+aug25 <- mergeEGFP(aug25)
+aug25 <- ensembl2symbol(aug25)
+message(sprintf("Dimensions: %d genes × %d cells", nrow(aug25), ncol(aug25)))
+aug25.srt <- CreateSeuratObject(
+  counts = aug25, 
+  project = "gfp2", 
+  min.cells = 3,
+  min.features = MIN_FEATURES
+)
+aug25.srt$sample <- "aug25_gfp"
+aug25.srt$condition <- "GFP"
+aug25.srt$batch <- "August2025"
+message(sprintf("Seurat object: %d cells retained\n", ncol(aug25.srt)))
+
+message("=== Loading Sample 3: aug25_ctl ===")
+aug25_ctl <- Read10X_h5(sample_paths$aug25_ctl)
+aug25_ctl <- mergeEGFP(aug25_ctl)
+aug25_ctl <- ensembl2symbol(aug25_ctl)
+message(sprintf("Dimensions: %d genes × %d cells", nrow(aug25_ctl), ncol(aug25_ctl)))
+aug25_ctl.srt <- CreateSeuratObject(
+  counts = aug25_ctl, 
+  project = "control", 
+  min.cells = 3,
+  min.features = MIN_FEATURES
+)
+aug25_ctl.srt$sample <- "aug25_ctl"
+aug25_ctl.srt$condition <- "Control"
+aug25_ctl.srt$batch <- "August2025"
+message(sprintf("Seurat object: %d cells retained\n", ncol(aug25_ctl.srt)))
+```
+
+# Quality Control
+
+## Calculate QC metrics
+
+```{r qc_metrics, message=FALSE, warning=FALSE}
+puppies.list <- list(mar25_gfp = mar25.srt, aug25_gfp = aug25.srt, aug25_ctl = aug25_ctl.srt)
+
+# Calculate QC metrics for each sample
+for (i in seq_along(puppies.list)) {
+  # Mitochondrial percentage (indicator of cell stress/death)
+  puppies.list[[i]][["percent.mt"]] <- PercentageFeatureSet(
+    puppies.list[[i]], 
+    pattern = "^mt-"  # Mouse mitochondrial genes start with "mt-" (lowercase)
+  )
+  
+  # Ribosomal percentage (high ribosomal content may indicate certain cell types)
+  puppies.list[[i]][["percent.ribo"]] <- PercentageFeatureSet(
+    puppies.list[[i]], 
+    pattern = "^Rp[sl]"  # Ribosomal protein genes
+  )
+  
+  # Hemoglobin percentage (important for blood samples)
+  puppies.list[[i]][["percent.hb"]] <- PercentageFeatureSet(
+    puppies.list[[i]], 
+    pattern = "^Hb[^(p)]"  # Hemoglobin genes, excluding Hbp (Hb binding protein)
+  )
+  
+  # Log10 features and counts for better visualization
+  puppies.list[[i]][["log10_nFeature_RNA"]] <- log10(puppies.list[[i]]$nFeature_RNA)
+  puppies.list[[i]][["log10_nCount_RNA"]] <- log10(puppies.list[[i]]$nCount_RNA)
+}
+```
+
+## Visualize QC metrics before filtering
+
+```{r qc_plots, message=FALSE, warning=FALSE, fig.width=12, fig.height=4}
+# Plot QC metrics for each sample
+for (i in seq_along(puppies.list)) {
+  sample_name <- names(puppies.list)[i]
+  message(sprintf("\n=== QC for %s ===", sample_name))
+  message(sprintf("Cells before filtering: %d", ncol(puppies.list[[i]])))
+  
+  p <- VlnPlot(
+    puppies.list[[i]], 
+    features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+    ncol = 3,
+    pt.size = 0.1
+  ) + plot_annotation(title = sample_name)
+  print(p)
+}
+```
+
+## Apply QC filters
+
+```{r qc_filter, message=FALSE, warning=FALSE}
+# QC thresholds - adjust based on your data
+# These are conservative thresholds suitable for blood samples
+QC_THRESHOLDS <- list(
+  max_mt = 20,           # Maximum mitochondrial percentage
+  min_features = 200,    # Minimum genes detected (already applied in CreateSeuratObject)
+  max_features = 6000,   # Maximum genes (remove potential doublets)
+  min_counts = 500,      # Minimum UMI counts
+  max_counts = 50000     # Maximum UMIs (remove potential doublets)
+)
+
+message("\n=== Applying QC Filters ===")
+message(sprintf("Thresholds: MT < %d%%, Features: %d-%d, Counts: %d-%d",
+                QC_THRESHOLDS$max_mt, QC_THRESHOLDS$min_features, 
+                QC_THRESHOLDS$max_features, QC_THRESHOLDS$min_counts,
+                QC_THRESHOLDS$max_counts))
+
+for (i in seq_along(puppies.list)) {
+  sample_name <- names(puppies.list)[i]
+  n_before <- ncol(puppies.list[[i]])
+  
+  puppies.list[[i]] <- subset(
+    puppies.list[[i]], 
+    subset = percent.mt < QC_THRESHOLDS$max_mt & 
+             nFeature_RNA >= QC_THRESHOLDS$min_features & 
+             nFeature_RNA <= QC_THRESHOLDS$max_features &
+             nCount_RNA >= QC_THRESHOLDS$min_counts &
+             nCount_RNA <= QC_THRESHOLDS$max_counts
+  )
+  
+  n_after <- ncol(puppies.list[[i]])
+  message(sprintf("%s: %d → %d cells (%.1f%% retained)", 
+                  sample_name, n_before, n_after, 100 * n_after / n_before))
+}
+
+message(sprintf("\nTotal cells after QC: %d", 
+                sum(sapply(puppies.list, ncol))))
+```
+
+# Merging and Normalization
+
+## Merge samples without integration
+
+```{r merge_samples, message=FALSE, warning=FALSE}
+message("\n=== Merging Samples ===")
+
+# Merge Seurat objects with cell ID prefixes to track sample origin
+puppies.merged <- merge(
+  puppies.list[[1]], 
+  y = c(puppies.list[[2]], puppies.list[[3]]), 
+  add.cell.ids = c("mar25_gfp", "aug25_gfp", "aug25_ctrl"), 
+  project = "PuppyBlood"
+)
+
+message(sprintf("Merged object: %d cells", ncol(puppies.merged)))
+message(sprintf("Merged object: %d features\n", nrow(puppies.merged)))
+
+# Join layers to create unified data matrix (required for some downstream analyses)
+puppies.merged <- JoinLayers(puppies.merged)
+```
+
+## Doublet detection with scDblFinder
+
+```{r doublet_detection, message=FALSE, warning=FALSE}
+message("\n=== Running Doublet Detection ===")
+
+# Convert to SingleCellExperiment for scDblFinder
+sce <- as.SingleCellExperiment(puppies.merged)
+
+# Extract sample IDs from cell barcodes
+sample_ids <- sub("_[ATCG]+.*$", "", colnames(puppies.merged))
+message(sprintf("Samples detected: %s", paste(unique(sample_ids), collapse = ", ")))
+
+# Run scDblFinder with sample-aware detection
+sce <- scDblFinder(sce, samples = sample_ids)
+
+# Transfer doublet calls back to Seurat object
+puppies.merged$scDblFinder.class <- sce$scDblFinder.class  # "singlet" or "doublet"
+puppies.merged$scDblFinder.score <- sce$scDblFinder.score  # Doublet probability [0-1]
+
+n_doublets <- sum(puppies.merged$scDblFinder.class == "doublet")
+message(sprintf("Doublets detected: %d (%.1f%%)\n", 
+                n_doublets, 100 * n_doublets / ncol(puppies.merged)))
+```
+
+## Normalization and dimensionality reduction
+
+```{r normalize_and_reduce, message=FALSE, warning=FALSE, fig.width=8, fig.height=5}
+message("\n=== Running Standard Workflow (Pre-doublet Removal) ===")
+
+# Set default assay
+DefaultAssay(puppies.merged) <- "RNA"
+
+# Log-normalization (default: scale factor = 10,000)
+message("Normalizing data...")
+puppies.merged <- NormalizeData(puppies.merged, normalization.method = "LogNormalize")
+
+# Identify highly variable features for downstream analysis
+message("Finding variable features...")
+puppies.merged <- FindVariableFeatures(
+  puppies.merged, 
+  selection.method = "vst",
+  nfeatures = 2000
+)
+
+# Scale and center gene expression (z-score transformation)
+message("Scaling data...")
+puppies.merged <- ScaleData(puppies.merged)
+
+# Run PCA on variable features
+message("Running PCA...")
+puppies.merged <- RunPCA(puppies.merged, npcs = 50, verbose = FALSE)
+
+# Visualize elbow plot to determine optimal number of PCs
+print(ElbowPlot(puppies.merged, ndims = 50) + 
+  ggtitle("PCA Elbow Plot") +
+  theme_classic())
+
+# Run UMAP for visualization
+message("Running UMAP...")
+PCA_DIMS <- 1:15 
+puppies.merged <- RunUMAP(
+  puppies.merged, 
+  reduction = "pca",
+  dims = PCA_DIMS,
+  verbose = FALSE
+)
+message("Dimensionality reduction complete\n")
+
+```
+
+## Visualize doublet detection results
+
+```{r doublet_viz, message=FALSE, warning=FALSE, fig.width=12, fig.height=5}
+# Common theme for publication-quality plots
+pub_theme <- theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18, margin = margin(b = 10)),
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12),
+    axis.line = element_line(linewidth = 0.8),
+    legend.position = "right",
+    plot.margin = margin(10, 10, 10, 10),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+# UMAP colored by doublet classification
+p1 <- DimPlot(
+  puppies.merged, 
+  reduction = "umap", 
+  group.by = "scDblFinder.class",
+  cols = c("singlet" = "lightblue", "doublet" = "red"),
+  pt.size = 0.5,
+  raster = FALSE,
+  shuffle = TRUE
+) +
+  labs(title = "Doublet Detection Results", x = "UMAP 1", y = "UMAP 2") +
+  pub_theme +
+  guides(color = guide_legend(
+    title = "Classification",
+    override.aes = list(size = 4, alpha = 1)
+  ))
+
+# UMAP colored by doublet probability score
+p2 <- FeaturePlot(
+  puppies.merged, 
+  features = "scDblFinder.score",
+  reduction = "umap",
+  pt.size = 0.5,
+  raster = FALSE
+) +
+  labs(title = "Doublet Probability Score", x = "UMAP 1", y = "UMAP 2") +
+  pub_theme +
+  scale_color_viridis_c(name = "Score", option = "plasma")
+
+# Display side by side
+print(p1 + p2)
+```
+
+## Remove doublets and reprocess
+
+```{r remove_doublets, message=FALSE, warning=FALSE, fig.width=8, fig.height=5}
+message("\n=== Removing Doublets and Reprocessing ===")
+n_before <- ncol(puppies.merged)
+
+# Filter out predicted doublets
+puppies.merged <- subset(puppies.merged, subset = scDblFinder.class == "singlet")
+
+n_after <- ncol(puppies.merged)
+message(sprintf("Cells retained: %d/%d (%.1f%%)\n", 
+                n_after, n_before, 100 * n_after / n_before))
+
+# Re-run complete workflow on singlets only
+message("Re-running analysis workflow on singlets...")
+DefaultAssay(puppies.merged) <- "RNA"
+
+puppies.merged <- NormalizeData(puppies.merged, normalization.method = "LogNormalize")
+puppies.merged <- FindVariableFeatures(
+  puppies.merged, 
+  selection.method = "vst",
+  nfeatures = 2000
+)
+puppies.merged <- ScaleData(puppies.merged)
+puppies.merged <- RunPCA(puppies.merged, npcs = 50, verbose = FALSE)
+
+# Check elbow plot again
+print(ElbowPlot(puppies.merged, ndims = 50) + 
+  ggtitle("PCA Elbow Plot (After Doublet Removal)") +
+  theme_classic())
+
+# Run UMAP with same parameters
+puppies.merged <- RunUMAP(
+  puppies.merged, 
+  reduction = "pca",
+  dims = PCA_DIMS,
+  verbose = FALSE
+)
+message("Reprocessing complete\n")
+```
+
+## Visualize by sample after doublet removal
+
+```{r viz_after_doublets, message=FALSE, warning=FALSE, fig.width=10, fig.height=7}
+# Define sample colors
+sample_colors <- c(
+  "mar25_gfp" = "#008B00",
+  "aug25_gfp" = "#7FFF00",
+  "aug25_ctl" = "#949290ff"
+)
+
+DimPlot(
+  puppies.merged, 
+  reduction = "umap", 
+  group.by = "sample",
+  cols = sample_colors,
+  pt.size = 0.6,
+  raster = FALSE,
+  shuffle = TRUE
+) +
+  labs(
+    title = "UMAP After Doublet Removal",
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ) +
+  pub_theme +
+  guides(color = guide_legend(
+    title = "Sample",
+    override.aes = list(size = 4, alpha = 1)
+  ))
+```
+
+
+## Publication-quality UMAP by sample origin
+
+```{r pub_umap_sample, message=FALSE, warning=FALSE, fig.width=10, fig.height=7}
+# Define sample labels for publication
+sample_labels <- c(
+  "mar25_gfp" = "GFP⁺ maternal cells (Batch 1)",
+  "aug25_gfp" = "GFP⁺ maternal cells (Batch 2)",
+  "aug25_ctl" = "GFP⁻ control"
+)
+
+# Create publication-ready UMAP
+p_sample <- DimPlot(
+  puppies.merged,
+  reduction = "umap",
+  group.by = "sample",
+  cols = sample_colors,
+  pt.size = 0.6,
+  raster = FALSE,
+  shuffle = TRUE
+) +
+  labs(
+    title = "Single-cell Landscape by Sample Origin",
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18, margin = margin(b = 15)),
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12),
+    axis.line = element_line(linewidth = 0.8),
+    legend.position = "right",
+    plot.margin = margin(15, 15, 15, 15),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  ) +
+  guides(color = guide_legend(
+    title = "Sample Origin",
+    override.aes = list(size = 4, alpha = 1)
+  ))
+
+# Display
+print(p_sample)
+
+# Create output directory for figures if it doesn't exist
+fig_dir <- file.path("/bigdata/almogangel/milk/paper_figures/")
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+  message(sprintf("Created output directory: %s", fig_dir))
+}
+
+# Save high-resolution versions for publication
+message("\nSaving publication figures...")
+ggsave(
+  filename = file.path(fig_dir, "Figure_UMAP_sample_origin.pdf"),
+  plot = p_sample,
+  width = 10,
+  height = 7,
+  dpi = 300,
+  device = cairo_pdf
+)
+message("Saved: figures/Figure_UMAP_sample_origin.pdf")
+
+ggsave(
+  filename = file.path(fig_dir, "Figure_UMAP_sample_origin.png"),
+  plot = p_sample,
+  width = 10,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+message("Saved: figures/Figure_UMAP_sample_origin.png")
+```
+
+
+# Cell Type Annotation
+
+## Automated annotation with SingleR
+
+```{r singler_annotation, message=FALSE, warning=FALSE, fig.width=14, fig.height=10}
+message("\n=== Running SingleR Cell Type Annotation ===")
+
+# Load reference datasets
+message("Loading reference datasets...")
+immgen_ref <- celldex::ImmGenData()      # ImmGen reference (immune cells)
+mouse_ref <- celldex::MouseRNAseqData()  # Bulk RNA-seq reference
+
+# Build cell neighborhood graph and cluster at moderate resolution for annotation
+# Using resolution=1.5 for fine-grained clusters to help SingleR
+message("Building neighbor graph...")
+puppies.merged <- FindNeighbors(puppies.merged, dims = PCA_DIMS, verbose = FALSE)
+puppies.merged <- FindClusters(puppies.merged, resolution = 1.5, verbose = FALSE)
+
+message(sprintf("Generated %d clusters for annotation", 
+                length(unique(puppies.merged$RNA_snn_res.1.5))))
+
+# Ensure layers are joined
+puppies.merged <- JoinLayers(puppies.merged)
+
+# Run SingleR with ImmGen reference (cluster-based for speed)
+message("\nAnnotating with ImmGen reference...")
+singler_immgen <- SingleR(
+  test = GetAssayData(puppies.merged, assay = "RNA", layer = "counts"),
+  ref = immgen_ref,
+  labels = immgen_ref$label.main,
+  clusters = puppies.merged$RNA_snn_res.1.5
+)
+
+# Add ImmGen annotations to metadata
+immgen_labels <- data.frame(
+  row.names = rownames(singler_immgen),
+  labels = singler_immgen$labels
+)
+puppies.merged$cell_type_singler_immgen <- immgen_labels[
+  as.character(puppies.merged$RNA_snn_res.1.5), "labels"
+]
+
+message(sprintf("ImmGen cell types: %s", 
+                paste(unique(puppies.merged$cell_type_singler_immgen), collapse = ", ")))
+
+# Run SingleR with MouseRNAseq reference
+message("\nAnnotating with MouseRNAseq reference...")
+singler_mouse <- SingleR(
+  test = GetAssayData(puppies.merged, assay = "RNA", layer = "counts"),
+  ref = mouse_ref,
+  labels = mouse_ref$label.main,
+  clusters = puppies.merged$RNA_snn_res.1.5
+)
+
+# Add MouseRNAseq annotations to metadata
+mouse_labels <- data.frame(
+  row.names = rownames(singler_mouse),
+  labels = singler_mouse$labels
+)
+puppies.merged$cell_type_singler_mouseRef <- mouse_labels[
+  as.character(puppies.merged$RNA_snn_res.1.5), "labels"
+]
+
+message(sprintf("MouseRNAseq cell types: %s", 
+                paste(unique(puppies.merged$cell_type_singler_mouseRef), collapse = ", ")))
+
+# Identify macrophages based on either reference
+singler_macrophages <- puppies.merged@meta.data |>
+  filter(cell_type_singler_immgen == "Macrophages" | 
+         cell_type_singler_mouseRef == "Macrophages") |>
+  rownames()
+
+puppies.merged$is_singler_mac <- ifelse(
+  rownames(puppies.merged@meta.data) %in% singler_macrophages,
+  "Macrophage",
+  "Other"
+)
+
+message(sprintf("\nMacrophages identified: %d (%.1f%%)\n",
+                length(singler_macrophages),
+                100 * length(singler_macrophages) / ncol(puppies.merged)))
+
+# Create consistent color mapping across references
+unique_types_immgen <- sort(unique(puppies.merged$cell_type_singler_immgen))
+unique_types_mouse <- sort(unique(puppies.merged$cell_type_singler_mouseRef))
+all_unique_types <- sort(unique(c(unique_types_immgen, unique_types_mouse)))
+
+# Generate color palette
+if (length(all_unique_types) > length(colors)) {
+  message("Warning: More cell types than colors available. Extending palette.")
+  color_mapping <- setNames(
+    colorRampPalette(colors)(length(all_unique_types)),
+    all_unique_types
+  )
+} else {
+  color_mapping <- setNames(colors[1:length(all_unique_types)], all_unique_types)
+}
+
+# Visualize annotations
+p_immgen <- dittoDimPlot(
+  puppies.merged,
+  reduction.use = "umap",
+  var = "cell_type_singler_immgen",
+  do.label = FALSE,
+  labels.size = 3,
+  color.panel = color_mapping[unique_types_immgen],
+  opacity = 0.7
+) + ggtitle("ImmGen Reference")
+
+p_mouse <- dittoDimPlot(
+  puppies.merged,
+  reduction.use = "umap",
+  var = "cell_type_singler_mouseRef",
+  do.label = FALSE,
+  labels.size = 3,
+  color.panel = color_mapping[unique_types_mouse],
+  opacity = 0.7
+) + ggtitle("MouseRNAseq Reference")
+
+p_mac <- dittoDimPlot(
+  puppies.merged,
+  reduction.use = "umap",
+  var = "is_singler_mac",
+  do.label = FALSE,
+  labels.size = 3
+) + ggtitle("Macrophage Identification")
+
+# Display combined plot
+print((p_immgen + p_mouse) / p_mac)
+```
+
+
+# Clustering
+
+## Find clusters at multiple resolutions
+
+```{r clustering, message=FALSE, warning=FALSE, fig.width=14, fig.height=12}
+message("\n=== Clustering Analysis ===")
+
+# Build neighborhood graph (if not already done)
+if (!"RNA_snn" %in% names(puppies.merged@graphs)) {
+  message("Building neighbor graph for clustering...")
+  puppies.merged <- FindNeighbors(
+    puppies.merged,
+    dims = PCA_DIMS,
+    reduction = "pca",
+    verbose = FALSE
+  )
+}
+
+# Test multiple clustering resolutions
+# Lower resolution = fewer, broader clusters
+# Higher resolution = more, finer-grained clusters
+resolutions <- c(0.1, 0.2, 0.3, 0.4)
+
+message("Testing clustering resolutions...")
+for (res in resolutions) {
+  puppies.merged <- FindClusters(
+    puppies.merged,
+    resolution = res,
+    verbose = FALSE
+  )
+  n_clusters <- length(unique(puppies.merged@meta.data[[paste0("RNA_snn_res.", res)]]))
+  message(sprintf("Resolution %.1f: %d clusters", res, n_clusters))
+}
+
+# Visualize all resolutions
+plots <- lapply(resolutions, function(res) {
+  dittoDimPlot(
+    puppies.merged,
+    reduction.use = "umap",
+    var = paste0("RNA_snn_res.", res),
+    color.panel = colors,
+    do.label = TRUE,
+    labels.size = 4
+  ) + ggtitle(sprintf("Resolution = %.1f", res))
+})
+
+# Display in grid
+print((plots[[1]] + plots[[2]]) / (plots[[3]] + plots[[4]]))
+
+```
+
+## Canonical marker genes
+
+```{r marker_genes, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+message("\n=== Visualizing Canonical Cell Type Markers ===")
+
+# Set active identity to resolution 0.1 for major cell types
+Idents(puppies.merged) <- puppies.merged$RNA_snn_res.0.4
+
+# Define canonical marker genes for blood cell types
+# Based on established literature for mouse immune cells
+ct_markers <- list(
+  `Monocytes` = c("Ccr2", "Lyz2", "Nr4a1"),
+  `Macrophages` = c("Csf1r", "Fcgr1", "Adgre1"),
+  `B cells` = c("Cd19", "Cd79a", "Cd79b"),
+  `T cells` = c("Cd3e", "Cd3d", "Cd3g"),
+  `Platelets` = c("Itga2b", "Gp1ba", "Pf4"),
+  `Neutrophils` = c("Cstdc4", "S100a9", "Stfa2"),
+  `Cycling cells` = c("Mki67", "Top2a", "Cenpf"),
+  `Megakaryocytes` = c("Ppbp", "Mpl", "Vwf")
+)
+
+DotPlot(object = puppies.merged, features = ct_markers) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(x="", y="Cluster ID")
+
+```
+
+# Based on "RNA_snn_res.0.4" clustering, seems like there are more doublets
+# Show a boxplot of scDblFinder.score for each cluster to confirm
+```{r doublet_score_boxplot, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+message("\n=== Visualizing Doublet Scores by Cluster (Resolution 0.4) ===")
+median_scores <- puppies.merged@meta.data |>
+    group_by(RNA_snn_res.0.4) |>
+    summarize(median_score = median(scDblFinder.score, na.rm = TRUE)) |>
+    arrange(median_score)
+
+# Reorder cluster factor levels by median score
+puppies.merged@meta.data$RNA_snn_res.0.4_ordered <- factor(
+    puppies.merged$RNA_snn_res.0.4,
+    levels = median_scores$RNA_snn_res.0.4
+)
+
+# Create boxplot
+ggplot(puppies.merged@meta.data, aes(x = RNA_snn_res.0.4_ordered, y = scDblFinder.score)) +
+    geom_boxplot(aes(fill = RNA_snn_res.0.4_ordered), outlier.size = 0.5) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "red", linewidth = 0.8) +
+    scale_fill_manual(values = colors) +
+    labs(
+        title = "Doublet Scores by Cluster (Resolution 0.4)",
+        x = "Cluster (ordered by median score)",
+        y = "scDblFinder Score"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 14, face = "bold"),
+        legend.position = "none"
+    )
+```
+
+# Cluster again and show marker genes after removing cluster 9
+
+```{r clustering, message=FALSE, warning=FALSE, fig.width=14, fig.height=12}
+message("\n=== Clustering Analysis ===")
+
+# Build neighborhood graph (if not already done)
+if (!"RNA_snn" %in% names(puppies.merged@graphs)) {
+  message("Building neighbor graph for clustering...")
+  puppies.merged <- FindNeighbors(
+    puppies.merged,
+    dims = PCA_DIMS,
+    reduction = "pca",
+    verbose = FALSE
+  )
+}
+
+# Test multiple clustering resolutions
+# Lower resolution = fewer, broader clusters
+# Higher resolution = more, finer-grained clusters
+resolutions <- c(0.1, 0.2, 0.3, 0.4)
+
+message("Testing clustering resolutions...")
+for (res in resolutions) {
+  puppies.merged <- FindClusters(
+    puppies.merged,
+    resolution = res,
+    verbose = FALSE
+  )
+  n_clusters <- length(unique(puppies.merged@meta.data[[paste0("RNA_snn_res.", res)]]))
+  message(sprintf("Resolution %.1f: %d clusters", res, n_clusters))
+}
+
+# Visualize all resolutions
+plots <- lapply(resolutions, function(res) {
+  dittoDimPlot(
+    puppies.merged,
+    reduction.use = "umap",
+    var = paste0("RNA_snn_res.", res),
+    color.panel = colors,
+    do.label = TRUE,
+    labels.size = 4
+  ) + ggtitle(sprintf("Resolution = %.1f", res))
+})
+
+# Display in grid
+print((plots[[1]] + plots[[2]]) / (plots[[3]] + plots[[4]]))
+
+```
+
+## Canonical marker genes
+
+```{r marker_genes, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+message("\n=== Visualizing Canonical Cell Type Markers ===")
+
+# Set active identity to resolution 0.1 for major cell types
+Idents(puppies.merged) <- puppies.merged$RNA_snn_res.0.1
+
+
+DotPlot(object = puppies.merged, features = ct_markers) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(x="", y="Cluster ID")
+
+```
+
+## Remove cluster 9 and reprocess
+```{r remove_cluster9, message=FALSE, warning=FALSE, fig.width=8, fig.height=5}
+message("\n=== Removing Cluster 9 (High Doublet Score) and Reprocessing ===")
+n_before <- ncol(puppies.merged)
+# Filter out cluster 9
+puppies.merged <- subset(puppies.merged, subset = RNA_snn_res.0.4 != "9")
+n_after <- ncol(puppies.merged)
+message(sprintf("Cells retained: %d/%d (%.1f%%)\n", n_after, n_before, 100 * n_after / n_before))
+# Re-run complete workflow
+message("Re-running analysis workflow after removing cluster 9...")
+DefaultAssay(puppies.merged) <- "RNA"
+puppies.merged <- NormalizeData(puppies.merged, normalization.method = "LogNormalize")
+puppies.merged <- FindVariableFeatures(
+  puppies.merged,
+  selection.method = "vst",
+  nfeatures = 2000
+)
+puppies.merged <- ScaleData(puppies.merged)
+puppies.merged <- RunPCA(puppies.merged, npcs = 50, verbose = FALSE)
+# Check elbow plot again
+print(ElbowPlot(puppies.merged, ndims = 50) +
+  ggtitle("PCA Elbow Plot (After Removing Cluster 9)") +
+  theme_classic())
+# Run UMAP with same parameters
+puppies.merged <- RunUMAP(
+  puppies.merged,
+  reduction = "pca",
+  dims = PCA_DIMS,
+  verbose = FALSE
+)
+message("Reprocessing complete\n")
+```
+
+## Canonical marker genes
+
+```{r marker_genes, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+message("\n=== Visualizing Canonical Cell Type Markers ===")
+
+# Set active identity to resolution 0.1 for major cell types
+Idents(puppies.merged) <- puppies.merged$RNA_snn_res.0.1
+
+DotPlot(object = puppies.merged, features = ct_markers) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(x="", y="Cluster ID")
+
+```
+
+# Combined plot of "RNA_snn_res.0.1" clustering, Singler annotations, Lyz2/Adgre1 expression and marker genes
+
+```{r combined_plot, message=FALSE, warning=FALSE, fig.width=16, fig.height=14}
+message("\n=== Creating Combined Cluster/Annotation/Marker Plot ===")
+
+# Set active identity to resolution 0.1
+Idents(puppies.merged) <- puppies.merged$RNA_snn_res.0.1
+
+# Create a unified color mapping for cell types across both SingleR references
+# Get unique cell types from both annotations
+immgen_types <- unique(puppies.merged$cell_type_singler_immgen)
+mouse_types <- unique(puppies.merged$cell_type_singler_mouseRef)
+all_cell_types <- unique(c(immgen_types, mouse_types))
+
+# Create consistent color palette
+unified_colors <- setNames(
+  colors[1:length(all_cell_types)],
+  all_cell_types
+)
+
+# 1. SingleR ImmGen annotation
+p_singler_immgen <- dittoDimPlot(
+  puppies.merged,
+  reduction.use = "umap",
+  var = "cell_type_singler_immgen",
+  color.panel = unified_colors,
+  do.label = FALSE,
+  labels.size = 3,
+  opacity = 0.7
+) +
+  ggtitle("SingleR: ImmGen Reference") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    legend.text = element_text(size = 9)
+  )
+
+# 2. SingleR MouseRNAseq annotation
+p_singler_mouse <- dittoDimPlot(
+  puppies.merged,
+  reduction.use = "umap",
+  var = "cell_type_singler_mouseRef",
+  color.panel = unified_colors,
+  do.label = FALSE,
+  labels.size = 3,
+  opacity = 0.7
+) +
+  ggtitle("SingleR: MouseRNAseq Reference") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    legend.text = element_text(size = 9)
+  )
+
+# 3. Clustering UMAP (Resolution 0.1)
+p_cluster <- dittoDimPlot(
+  puppies.merged,
+  reduction.use = "umap",
+  var = "RNA_snn_res.0.1",
+  color.panel = colors,
+  do.label = TRUE,
+  labels.size = 4,
+  opacity = 0.8
+) +
+  ggtitle("Clustering (Resolution 0.1)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12))
+
+# 4. Lyz2 expression (normalized)
+p_lyz2 <- FeaturePlot(
+  puppies.merged,
+  features = "Lyz2",
+  reduction = "umap",
+  pt.size = 0.5,
+  slot = "data"  # Use normalized data
+) +
+  scale_color_viridis_c(option = "plasma", name = "Normalized\nExpression") +
+  ggtitle("Lyz2 Expression") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12))
+
+# 5. Adgre1 (F4/80) expression (normalized)
+p_adgre1 <- FeaturePlot(
+  puppies.merged,
+  features = "Adgre1",
+  reduction = "umap",
+  pt.size = 0.5,
+  slot = "data"  # Use normalized data
+) +
+  scale_color_viridis_c(option = "plasma", name = "Normalized\nExpression") +
+  ggtitle("Adgre1 (F4/80) Expression") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12))
+
+# 6. Marker gene dotplot
+p_dotplot <- DotPlot(
+  object = puppies.merged,
+  features = ct_markers,
+  dot.scale = 6
+) +
+  RotatedAxis() +
+  labs(x = "", y = "Cluster ID", title = "Canonical Cell Type Markers") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 10)
+  )
+
+# Combine all plots: 2 refs on top, clustering + markers on bottom
+combined_plot <- (p_singler_immgen | p_singler_mouse) / 
+                 (p_cluster | p_lyz2 | p_adgre1) /
+                 p_dotplot +
+  plot_layout(heights = c(1, 1, 1.2))
+
+print(combined_plot)
+
+# Save combined figure
+message("\nSaving combined cluster/annotation figure...")
+ggsave(
+  filename = file.path(fig_dir, "Figure_combined_cluster_annotation.pdf"),
+  plot = combined_plot,
+  width = 16,
+  height = 14,
+  dpi = 300
+)
+message("Saved: figures/Figure_combined_cluster_annotation.pdf")
+
+ggsave(
+  filename = file.path(fig_dir, "Figure_combined_cluster_annotation.png"),
+  plot = combined_plot,
+  width = 16,
+  height = 14,
+  dpi = 300,
+  bg = "white"
+)
+message("Saved: figures/Figure_combined_cluster_annotation.png")
+
+```
+
+## Manual cell type annotation
+
+```{r manual_annotation, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+message("\n=== Applying Manual Cell Type Annotations ===")
+
+# Initialize annotation column
+puppies.merged$manual_annotation <- NA
+
+# Assign cell types based on cluster identity and marker expression
+# Using resolution 0.1 for broad cell type categories
+annotations <- list(
+  "0" = "Macrophages",
+  "1" = "B cells",
+  "2" = "Macrophages (cycling)",
+  "3" = "Platelets",
+  "4" = "T cells",
+  "5" = "Megakaryocytes (cycling)",  # Review if cycling platelets or megakaryocytes
+  "6" = "Macrophages-2",
+  "7" = "Neutrophils"
+)
+
+# Apply annotations
+for (cluster_id in names(annotations)) {
+  cells <- rownames(puppies.merged@meta.data[
+    puppies.merged$RNA_snn_res.0.1 == cluster_id, 
+  ])
+  puppies.merged@meta.data[cells, "manual_annotation"] <- annotations[[cluster_id]]
+}
+
+# Print annotation summary
+annotation_summary <- table(puppies.merged$manual_annotation)
+message("\nCell type distribution:")
+for (ct in names(annotation_summary)) {
+  message(sprintf("  %s: %d cells (%.1f%%)",
+                  ct,
+                  annotation_summary[ct],
+                  100 * annotation_summary[ct] / ncol(puppies.merged)))
+}
+
+# Visualize manual annotations
+p_manual <- dittoDimPlot(
+  puppies.merged,
+  reduction.use = "umap",
+  var = "manual_annotation",
+  color.panel = colors,
+  do.label = TRUE,
+  labels.size = 4,
+  opacity = 0.8
+) +
+  ggtitle("Manual Cell Type Annotation") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+
+print(p_manual)
+
+# Set manual annotation as active identity for downstream analysis
+Idents(puppies.merged) <- puppies.merged$manual_annotation
+
+message("\nManual annotation complete. Active identity set to 'manual_annotation'\n")
+```
+
+
+## Publication-quality UMAP with cell type annotations
+
+```{r pub_umap_celltype, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+message("\n=== Creating Publication Figure with Cell Type Annotations ===")
+
+# Get UMAP coordinates and cell type annotations
+umap_coords <- as.data.frame(Embeddings(puppies.merged, reduction = "umap"))
+colnames(umap_coords) <- c("UMAP_1", "UMAP_2")
+umap_coords$cluster <- puppies.merged$manual_annotation
+umap_coords$sample <- puppies.merged$sample
+
+# Define sample colors (for points)
+sample_colors <- c(
+  "mar25_gfp" = "#008B00",
+  "aug25_gfp" = "#7FFF00",
+  "aug25_ctl" = "#949290ff"
+)
+
+# Exclude C6 - Macrophages from circle/label annotation only (not from points)
+umap_coords_for_mask <- umap_coords[umap_coords$cluster != "Macrophages-2", ]
+
+# Define cluster colors (for outlines) - excluding C6
+clusters_to_plot <- sort(unique(umap_coords_for_mask$cluster))
+cluster_colors <- colors[1:length(clusters_to_plot)]
+names(cluster_colors) <- clusters_to_plot
+
+# Generate mascarade mask for cluster outlines (excluding C6)
+maskTable <- generateMask(
+  dims = umap_coords_for_mask[, c("UMAP_1", "UMAP_2")], 
+  clusters = umap_coords_for_mask$cluster
+)
+
+# Create fancy mask with connected labels
+fancyMask <- list(
+  geom_mark_shape(
+    data = maskTable, 
+    fill = NA, 
+    aes(group = group, label = cluster),
+    color = "black",
+    linewidth = 0.8, 
+    expand = unit(-1, "pt"),
+    con.cap = 0, 
+    con.type = "elbow",
+    label.fontsize = 14, 
+    label.buffer = unit(8, "mm"),
+    label.fontface = "bold",
+    label.minwidth = 0,
+    label.margin = margin(3, 3, 3, 3, "pt"),
+    label.lineheight = 1,
+    label.fill = "white",
+    show.legend = FALSE
+  ),
+  scale_x_continuous(expand = expansion(mult = 0.15)),
+  scale_y_continuous(expand = expansion(mult = 0.15))
+)
+
+# Create the publication-quality UMAP plot with mascarade
+# Points colored by sample (ALL cells including C6), outlines by cell type (excluding C6)
+p_celltype <- ggplot(umap_coords, aes(x = UMAP_1, y = UMAP_2)) + 
+  geom_point(aes(color = sample), size = 0.8, alpha = 0.8) +
+  scale_color_manual(
+    values = sample_colors,
+    name = "Sample Origin",
+    labels = c(
+      "mar25_gfp" = "GFP+ maternal cells (Batch 1)",
+      "aug25_gfp" = "GFP+ maternal cells (Batch 2)",
+      "aug25_ctl" = "GFP- control"
+    )
+  ) +
+  fancyMask +
+  labs(
+    title = "",
+    x = "UMAP-1",
+    y = "UMAP-2"
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18, margin = margin(b = 15)),
+    axis.title = element_text(size = 18, face = "bold"),
+    axis.text = element_text(size = 18),
+    axis.line = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    legend.position = c(0.02, 0.02),
+    legend.justification = c(0, 0),
+    legend.title = element_text(face = "bold", size = 16),
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.box.background = element_blank(),
+    plot.margin = margin(15, 10, 15, 10),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+# Display the plot
+print(p_celltype)
+
+# Save high-resolution versions for publication
+message("\nSaving cell type annotation figures...")
+ggsave(
+  filename = file.path(fig_dir, "Figure_UMAP_celltype_annotation.pdf"),
+  plot = p_celltype,
+  width = 9,
+  height = 12,
+  dpi = 300,
+  device = cairo_pdf
+)
+message("Saved: figures/Figure_UMAP_celltype_annotation.pdf")
+
+ggsave(
+  filename = file.path(fig_dir, "Figure_UMAP_celltype_annotation.png"),
+  plot = p_celltype,
+  width = 9,
+  height = 12,
+  dpi = 300,
+  bg = "white"
+)
+message("Saved: figures/Figure_UMAP_celltype_annotation.png")
+```
+
+
+# Comparative Analysis
+
+## Create experimental groups
+
+```{r create_groups, message=FALSE, warning=FALSE}
+message("\n=== Creating Experimental Groups ===")
+
+# Create a 'group' column combining GFP replicates vs control
+# This simplifies downstream comparisons
+puppies.merged$group <- puppies.merged$sample
+
+# Combine both GFP batches into single group
+puppies.merged$group[puppies.merged$group %in% c("mar25_gfp", "aug25_gfp")] <- "gfp"
+
+# Rename control for clarity
+puppies.merged$group[puppies.merged$group == "aug25_ctl"] <- "control"
+
+# Report group distribution
+group_table <- table(puppies.merged$group)
+message("\nExperimental groups:")
+for (grp in names(group_table)) {
+  message(sprintf("  %s: %d cells (%.1f%%)", 
+                  grp, group_table[grp], 
+                  100 * group_table[grp] / ncol(puppies.merged)))
+}
+```
+
+## Cell type composition by group
+
+```{r composition_analysis, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+message("\n=== Analyzing Cell Type Composition ===")
+
+# Create stacked barplot showing cell type proportions
+p_composition <- dittoBarPlot(
+  puppies.merged, 
+  var = "manual_annotation",
+  group.by = "group",
+  scale = "percent",
+  color.panel = colors[1:8]
+) +
+  labs(
+    title = "Cell Type Composition by Group",
+    y = "Percentage of Cells",
+    x = "Experimental Group",
+    fill = "Cell Type"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    legend.text = element_text(size = 10)
+  )
+
+print(p_composition)
+
+# Save composition figure
+ggsave(
+  filename = file.path(fig_dir, "Figure_composition_by_group.pdf"),
+  plot = p_composition,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+message("Saved: figures/Figure_composition_by_group.pdf")
+```
+
+# Macrophage Subset Analysis
+
+## Subset and re-cluster macrophages
+
+```{r subset_macrophages, message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+message("\n=== Subsetting Macrophage Populations ===")
+
+# Identify macrophage clusters based on manual annotation
+mac_clusters <- c("Macrophages")
+
+# Subset macrophage cells
+mac.srt <- subset(
+  puppies.merged,
+  subset = manual_annotation %in% mac_clusters
+)
+
+message(sprintf("Macrophages subset: %d cells (%.1f%% of total)",
+                ncol(mac.srt),
+                100 * ncol(mac.srt) / ncol(puppies.merged)))
+
+# Remove genes with zero counts after subsetting
+mac.srt <- mac.srt[rowSums(GetAssayData(mac.srt, layer = "counts")) > 0, ]
+message(sprintf("Features after filtering: %d", nrow(mac.srt)))
+
+# Re-run normalization and dimensionality reduction on subset
+message("\nRe-analyzing macrophage subset...")
+mac.srt <- NormalizeData(mac.srt, verbose = FALSE)
+mac.srt <- FindVariableFeatures(mac.srt, nfeatures = 2000, verbose = FALSE)
+mac.srt <- ScaleData(mac.srt, verbose = FALSE)
+mac.srt <- RunPCA(mac.srt, npcs = 50, verbose = FALSE)
+
+# Check elbow plot
+print(ElbowPlot(mac.srt, ndims = 50) + 
+  ggtitle("PCA Elbow Plot - Macrophage Subset") +
+  theme_classic())
+
+# Use 15 PCs based on elbow
+MAC_PCA_DIMS <- 1:15
+
+# Run UMAP without batch correction first
+mac.srt <- RunUMAP(mac.srt, reduction = "pca", dims = MAC_PCA_DIMS, verbose = FALSE)
+
+# Visualize by group and SingleR annotations
+p1 <- dittoDimPlot(
+  mac.srt,
+  reduction.use = "umap",
+  var = "group",
+  color.panel = c("control" = "#949290ff", "gfp" = "#008B00"),
+  opacity = 0.7
+) + ggtitle("By Experimental Group")
+
+p2 <- dittoDimPlot(
+  mac.srt,
+  reduction.use = "umap",
+  var = "cell_type_singler_immgen",
+  do.label = FALSE,
+  labels.size = 3,
+  opacity = 0.7
+) + ggtitle("ImmGen Annotation")
+
+p3 <- dittoDimPlot(
+  mac.srt,
+  reduction.use = "umap",
+  var = "cell_type_singler_mouseRef",
+  do.label = FALSE,
+  labels.size = 3,
+  opacity = 0.7
+) + ggtitle("MouseRNAseq Annotation")
+
+print((p1 | p2) / p3)
+```
+
+## Macrophage re-clustering
+
+```{r mac_clustering, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+message("\n=== Clustering Macrophage Subset ===")
+
+# Build neighborhood graph and cluster
+mac.srt <- FindNeighbors(mac.srt, dims = MAC_PCA_DIMS, verbose = FALSE)
+mac.srt <- FindClusters(mac.srt, resolution = 0.4, verbose = FALSE)
+
+Idents(mac.srt) <- mac.srt$RNA_snn_res.0.4
+message(sprintf("Generated %d clusters", length(unique(Idents(mac.srt)))))
+
+# Visualize clusters and markers
+p_cluster <- dittoDimPlot(
+  mac.srt,
+  reduction.use = "umap",
+  var = "RNA_snn_res.0.4",
+  color.panel = colors,
+  opacity = 0.7,
+  do.label = TRUE,
+  labels.size = 5
+) + ggtitle("Macrophage Clusters (Resolution 0.4)")
+
+print(p_cluster)
+```
+
+## Macrophage marker gene analysis
+
+```{r mac_markers, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+message("\n=== Analyzing Macrophage Markers ===")
+
+# Define macrophage-specific markers from literature
+# Reference: https://molmed.biomedcentral.com/articles/10.1186/s10020-024-00970-0
+mac_markers <- list(
+  `Classical Mono` = c("Fn1", "F13a1", "Sell", "Ccr2", "Chil3", "Cd14"),
+  `MHC-II` = c("H2-Ab1", "H2-Aa", "H2-Eb1", "Cd74", "Tmem176a", "Tmem176b"),
+  `Non-classical Mono` = c("Nr4a1", "Pou2f2", "Ace", "Cd36", "Fcgr4", "Itgal"),
+  `M2-like Mac` = c("C1qa", "C1qb", "C1qc", "Mrc1", "Hmox1", "Vcam1", "Cd163"),
+  `ISG+ Mac` = c("Isg15", "Ifi204", "Ifit3", "Irf7", "Cxcl10"),
+  `Cycling` = c("Mki67", "Stmn1", "Top2a", "Cenpf"),
+  `M-MDSCs` = c("S100a8", "S100a9", "Ltf")
+)
+
+p_mac_markers <- DotPlot(
+  object = mac.srt,
+  features = mac_markers,
+  dot.scale = 8
+) +
+  RotatedAxis() +
+  labs(
+    title = "Macrophage Marker Expression",
+    x = "",
+    y = "Cluster ID"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p_mac_markers)
+```
+
+
+# Differential Expression Analysis
+
+## GFP vs Control comparison in macrophages
+
+```{r de_analysis, message=FALSE, warning=FALSE}
+message("\n=== Differential Expression Analysis: GFP vs Control ===")
+
+# Set default assay
+DefaultAssay(mac.srt) <- "RNA"
+
+# Check group distribution
+group_dist <- table(mac.srt$group)
+message("\nGroup distribution:")
+for (grp in names(group_dist)) {
+  message(sprintf("  %s: %d cells", grp, group_dist[grp]))
+}
+
+# Set identity for DE analysis
+Idents(mac.srt) <- "group"
+
+# Save the macrophage object for future use
+message("\nSaving macrophage object...")
+saveRDS(
+  mac.srt,
+  file = file.path(getwd(), "mac_gfp_control.rds")
+)
+message("Saved: mac_gfp_control.rds")
+
+# Run differential expression analysis
+# Comparing GFP (maternal cells) vs Control
+message("\nRunning FindMarkers (Wilcoxon test)...")
+de_results <- FindMarkers(
+  mac.srt,
+  ident.1 = "gfp",
+  ident.2 = "control",
+  logfc.threshold = 0,        # Include all genes for comprehensive analysis
+  test.use = "wilcox",        # Wilcoxon rank-sum test (non-parametric)
+  min.pct = 0.1,              # Gene must be detected in ≥10% of cells in either group
+  verbose = TRUE
+)
+
+# Add gene names as a column
+de_results$gene <- rownames(de_results)
+
+# Calculate additional statistics
+de_results$abs_log2FC <- abs(de_results$avg_log2FC)
+de_results$neg_log10_padj <- -log10(de_results$p_val_adj + 1e-300)  # Add small value to avoid Inf
+
+# Report results
+total_genes <- nrow(de_results)
+sig_genes <- de_results[de_results$p_val_adj < 0.05, ]
+up_genes <- sig_genes[sig_genes$avg_log2FC > 0, ]
+down_genes <- sig_genes[sig_genes$avg_log2FC < 0, ]
+
+message(sprintf("\n=== DE Results ==="))
+message(sprintf("Total genes tested: %d", total_genes))
+message(sprintf("Significant genes (padj < 0.05): %d (%.1f%%)",
+                nrow(sig_genes), 100 * nrow(sig_genes) / total_genes))
+message(sprintf("  Upregulated in GFP: %d", nrow(up_genes)))
+message(sprintf("  Downregulated in GFP: %d", nrow(down_genes)))
+
+# Save DE results
+message("\nSaving DE results...")
+saveRDS(
+  de_results,
+  file = file.path(getwd(), "de_gfp_vs_control.rds")
+)
+
+write.csv(
+  de_results,
+  file = file.path(getwd(), "de_gfp_vs_control.csv"),
+  row.names = FALSE
+)
+message("Saved: de_gfp_vs_control.rds and .csv\n")
+```
+
+## Volcano plot visualization
+
+```{r volcano_plot, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+message("\n=== Creating Volcano Plot ===")
+
+# Prepare data for volcano plot
+volcano_data <- de_results
+
+# Define significance thresholds
+fc_threshold <- 0.5
+pval_threshold <- 0.05
+
+# Classify genes
+volcano_data$regulation <- "Not Significant"
+volcano_data$regulation[
+  volcano_data$p_val_adj < pval_threshold & 
+  volcano_data$avg_log2FC > fc_threshold
+] <- "Upregulated in GFP"
+volcano_data$regulation[
+  volcano_data$p_val_adj < pval_threshold & 
+  volcano_data$avg_log2FC < -fc_threshold
+] <- "Downregulated in GFP"
+
+# Convert to factor with desired order
+volcano_data$regulation <- factor(
+  volcano_data$regulation,
+  levels = c("Upregulated in GFP", "Downregulated in GFP", "Not Significant")
+)
+
+# Count genes in each category
+reg_counts <- table(volcano_data$regulation)
+message("\nRegulation categories:")
+for (cat in names(reg_counts)) {
+  message(sprintf("  %s: %d genes", cat, reg_counts[cat]))
+}
+
+# Select top genes to label
+n_top_label <- 10
+top_up1 <- volcano_data |>
+  filter(regulation == "Upregulated in GFP") |>
+  arrange(desc(avg_log2FC)) |>
+  head(9) |>
+  pull(gene)
+
+top_up2 <- volcano_data |>
+  filter(regulation == "Upregulated in GFP") |>
+  arrange(p_val_adj) |>
+  head(8) |>
+  pull(gene)
+
+top_up <- c(top_up1, top_up2) |> unique()
+
+top_down1 <- volcano_data |>
+  filter(regulation == "Downregulated in GFP") |>
+  arrange(avg_log2FC) |>
+  head(n_top_label) |>
+  pull(gene)
+
+top_down2 <- volcano_data |>
+  filter(regulation == "Downregulated in GFP") |>
+  arrange(p_val_adj) |>
+  head(n_top_label) |>
+  pull(gene)
+
+top_down <- c(top_down1, top_down2) |> unique()
+
+volcano_data$label <- ""
+volcano_data$label[volcano_data$gene %in% c(top_up, top_down)] <- 
+  volcano_data$gene[volcano_data$gene %in% c(top_up, top_down)]
+
+# Create volcano plot
+p_volcano <- ggplot(
+  volcano_data,
+  aes(x = avg_log2FC, y = neg_log10_padj, color = regulation)
+) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(
+    values = c(
+      "Upregulated in GFP" = "#008B00",
+      "Downregulated in GFP" = "#d6b089ff",
+      "Not Significant" = "grey70"
+    ),
+    name = ""
+  ) +
+  geom_vline(
+    xintercept = c(-fc_threshold, fc_threshold),
+    linetype = "dashed",
+    color = "grey30",
+    alpha = 0.7
+  ) +
+  geom_hline(
+    yintercept = -log10(pval_threshold),
+    linetype = "dashed",
+    color = "grey30",
+    alpha = 0.7
+  ) +
+  geom_text_repel(
+    aes(label = label),
+    max.overlaps = 25,
+    size = 4,
+    fontface = "bold.italic",
+    color = "black",
+    box.padding = 0.6,
+    point.padding = 0.5,
+    segment.color = "grey50",
+    segment.size = 0.3,
+    min.segment.length = 0,
+    force = 3,
+    force_pull = 0.5,
+    nudge_x = 0.1,
+    nudge_y = 0.5
+  ) +
+  labs(
+    title = "",
+    x = "Log2 Fold Change",
+    y = "-log10(Adjusted P-value)"
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18, margin = margin(b = 15)),
+    axis.title = element_text(size = 18, face = "bold"),
+    axis.text = element_text(size = 18),
+    axis.line = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    legend.position = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.title = element_text(face = "bold", size = 16),
+    legend.text = element_text(size = 14),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    plot.margin = margin(15, 10, 15, 10),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  )
+
+print(p_volcano)
+
+# Save volcano plot
+message("\nSaving volcano plot...")
+ggsave(
+  filename = file.path(fig_dir, "Figure_volcano_GFP_vs_Control.pdf"),
+  plot = p_volcano,
+  width = 9,
+  height = 12,
+  dpi = 300,
+  device = cairo_pdf
+)
+message("Saved: figures/Figure_volcano_GFP_vs_Control.pdf")
+
+ggsave(
+  filename = file.path(fig_dir, "Figure_volcano_GFP_vs_Control.png"),
+  plot = p_volcano,
+  width = 9,
+  height = 12,
+  dpi = 300,
+  bg = "white"
+)
+message("Saved: figures/Figure_volcano_GFP_vs_Control.png\n")
+```
+
+# Pathway Enrichment Analysis
+
+## Prepare gene sets and run UCell scoring
+
+```{r pathway_setup, message=FALSE, warning=FALSE}
+message("\n=== Pathway Enrichment Analysis Setup ===")
+
+# Load required libraries for pathway analysis
+
+# Filter genes with zero counts across cells
+# This ensures only expressed genes are included in pathway analysis
+message("Filtering genes with zero counts...")
+genes_keep <- rownames(mac.srt)[
+  Matrix::rowSums(GetAssayData(mac.srt, assay = "RNA", layer = "counts")) > 0
+]
+mac.srt <- mac.srt[genes_keep, ]
+message(sprintf("Retained %d genes with non-zero counts", length(genes_keep)))
+
+# Save filtered object for pathway analysis
+message("\nSaving filtered macrophage object...")
+saveRDS(genes_keep, file.path(getwd(), "pathway_genes_kept.rds"))
+saveRDS(mac.srt, file.path(getwd(), "mac_gfp_control_filtered.rds"))
+message("Saved: pathway_genes_kept.rds and mac_gfp_control_filtered.rds")
+
+# Load multiple gene set databases from MSigDB
+# C7: Immunologic signatures
+# C5: Gene Ontology (GO) terms
+# H: Hallmark gene sets
+# C2:KEGG: KEGG pathways
+# C2:REACTOME: Reactome pathways
+message("\nLoading MSigDB gene set databases...")
+immuno_db <- msigdbr(species = "Mus musculus", category = "C7")
+go_db <- msigdbr(species = "Mus musculus", category = "C5")
+hallmark_db <- msigdbr(species = "Mus musculus", category = "H")
+kegg_db <- msigdbr(species = "Mus musculus", category = "C2", subcategory = "CP:KEGG_LEGACY")
+reactome_db <- msigdbr(species = "Mus musculus", category = "C2", subcategory = "CP:REACTOME")
+
+
+# Combine all databases
+all_pathways <- bind_rows(
+  immuno_db,
+  go_db,
+  hallmark_db,
+  kegg_db,
+  reactome_db
+)
+message(sprintf("Total gene sets: %d", length(unique(all_pathways$gs_name))))
+
+
+# Filter gene sets to only include genes present in the dataset
+# Requirements:
+# - At least 5 genes per pathway (statistical power)
+# - Maximum 800 genes per pathway (specificity)
+message("\nFiltering gene sets...")
+filtered_pathways <- all_pathways %>%
+  filter(gene_symbol %in% genes_keep) %>%
+  group_by(gs_name) %>%
+  filter(n() >= 5 & n() < 800) %>%
+  ungroup()
+
+message(sprintf("Retained %d gene sets after filtering", 
+                length(unique(filtered_pathways$gs_name))))
+
+# Create gene set list for UCell
+gene_sets <- split(filtered_pathways$gene_symbol, filtered_pathways$gs_name)
+message(sprintf("Created gene set list with %d pathways", length(gene_sets)))
+
+# Function to test pathway enrichment using UCell
+# 
+# @param seurat_obj Seurat object with 'group' metadata (gfp/control)
+# @param gene_sets Named list of gene sets to score
+# @param n_cores Number of cores for parallel processing
+# @param max_rank_genes Maximum rank for UCell scoring (controls sensitivity)
+# @return Tibble with pathway scores per group
+test_pathway <- function(seurat_obj, gene_sets, n_cores = 30, max_rank_genes = 1000) {
+  
+  message(sprintf("\nScoring %d pathways with UCell...", length(gene_sets)))
+  message(sprintf("Parameters: max_rank=%d, cores=%d", max_rank_genes, n_cores))
+  
+  # Score pathways using UCell
+  # UCell uses Mann-Whitney U statistic to evaluate signature enrichment
+  seurat_obj <- AddModuleScore_UCell(
+    seurat_obj, 
+    features = gene_sets, 
+    maxRank = max_rank_genes, 
+    ncores = n_cores
+  )
+  
+  # Save object with UCell scores
+  saveRDS(seurat_obj, file.path(getwd(), "mac_with_ucell_scores.rds"))
+  message("Saved: mac_with_ucell_scores.rds")
+  
+  # Extract UCell score columns
+  ucell_cols <- grep("_UCell$", colnames(seurat_obj@meta.data), value = TRUE)
+  message(sprintf("Extracted %d UCell score columns", length(ucell_cols)))
+  
+  # Split scores by experimental group
+  gfp_index <- seurat_obj$group == "gfp"
+  
+  message("Extracting scores per group...")
+  res <- parallel::mclapply(ucell_cols, function(col) {
+    scores <- seurat_obj@meta.data[[col]]
+    tibble(
+      pathway = gsub("_UCell", "", col),
+      group = c("gfp_score", "control_score"),
+      score = list(scores[gfp_index], scores[!gfp_index])
+    )
+  }, mc.cores = n_cores)
+  
+  res <- bind_rows(res)
+  message("Pathway scoring complete\n")
+  
+  return(res)
+}
+
+```
+
+## Run pathway enrichment analysis
+
+```{r pathway_enrichment, message=FALSE, warning=FALSE}
+message("\n=== Running Pathway Enrichment Analysis ===")
+# Check if raw pathway results already exist
+raw_results_file <- file.path("/bigdata/almogangel/milk/pathway_results_raw.rds")
+
+if (file.exists(raw_results_file)) {
+  message("\n=== Loading existing pathway results ===")
+  pathway_results <- readRDS(raw_results_file)
+  message(sprintf("Loaded pathway results for %d pathways", 
+                  length(unique(pathway_results$pathway))))
+} else {
+  message("\n=== Computing pathway scores with UCell ===")
+  # Test pathways using UCell
+  pathway_results <- test_pathway(
+    seurat_obj = mac.srt,
+    gene_sets = gene_sets,
+    n_cores = 50,
+    max_rank_genes = 1000
+  )
+  
+  # Save raw pathway results
+  saveRDS(pathway_results, raw_results_file)
+  message("Saved: pathway_results_raw.rds")
+}
+
+# Function to normalize pathway scores using Z-score (mean/SD)
+# 
+# Z-score normalization centers data at mean and scales by standard deviation
+# More stable than MAD for pathway scores with low variance
+# 
+# @param scores_gfp Numeric vector of scores for GFP group
+# @param scores_control Numeric vector of scores for control group
+# @return List with normalized scores for both groups
+normalize_pathway <- function(scores_gfp, scores_control) {
+  # Combine all scores to calculate global mean and SD
+  all_scores <- c(scores_gfp, scores_control)
+  mean_val <- mean(all_scores, na.rm = TRUE)
+  sd_val <- sd(all_scores, na.rm = TRUE)
+  
+  # Floor SD to prevent division by very small values
+  sd_val <- max(sd_val, 0.01)
+  
+  # Normalize scores: (x - mean) / SD
+  gfp_norm <- (scores_gfp - mean_val) / sd_val
+  control_norm <- (scores_control - mean_val) / sd_val
+  
+  list(gfp_norm = gfp_norm, control_norm = control_norm)
+}
+
+# Normalize pathway scores
+message("\nNormalizing pathway scores...")
+pathway_results <- pathway_results |> 
+  mutate(score_norm = list(numeric()))
+
+for (pw in unique(pathway_results$pathway)) {
+  pw_rows <- pathway_results$pathway == pw
+  gfp_scores <- pathway_results$score[pw_rows & pathway_results$group == "gfp_score"][[1]]
+  ctl_scores <- pathway_results$score[pw_rows & pathway_results$group == "control_score"][[1]]
+  
+  # Apply normalization
+  normed <- normalize_pathway(gfp_scores, ctl_scores)
+  
+  # Assign normalized scores
+  pathway_results$score_norm[pw_rows & pathway_results$group == "gfp_score"] <- 
+    list(normed$gfp_norm)
+  pathway_results$score_norm[pw_rows & pathway_results$group == "control_score"] <- 
+    list(normed$control_norm)
+}
+
+message("Normalization complete")
+
+```
+
+## Statistical testing of pathway differences
+
+```{r pathway_stats, message=FALSE, warning=FALSE}
+message("\n=== Statistical Testing of Pathway Enrichment ===")
+
+# Calculate pathway statistics comparing GFP vs Control
+# Uses normalized scores, Wilcoxon rank-sum test, and Cohen's d effect size
+pathway_stats_norm <- pathway_results %>%
+  select(-score) |> 
+  mutate(group = dplyr::recode(group, gfp_score = "gfp", control_score = "control")) %>%
+  group_by(pathway, group) %>%
+  summarise(scores = list(as.numeric(unlist(score_norm))), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = group, values_from = scores) %>%
+  filter(!map_lgl(gfp, is.null), !map_lgl(control, is.null)) %>%
+  mutate(
+    gfp = map(gfp, ~ .x[!is.na(.x)]),
+    control = map(control, ~ .x[!is.na(.x)])
+  ) %>%
+  filter(lengths(gfp) >= 2, lengths(control) >= 2) %>%
+  mutate(
+    effect_size = (map_dbl(gfp, mean) - map_dbl(control, mean)) / sqrt((map_dbl(gfp, var) + map_dbl(control, var)) / 2),
+    p_value = map2_dbl(gfp, control, ~ suppressWarnings(wilcox.test(.x, .y)$p.value)),
+    p_adj = p.adjust(p_value, method = "fdr")
+  ) %>%
+  dplyr::select(pathway, effect_size, p_value, p_adj)
+
+message(sprintf("Tested %d pathways", nrow(pathway_stats_norm)))
+message(sprintf("Significant pathways (padj < 0.05): %d", 
+                sum(pathway_stats_norm$p_adj < 0.05, na.rm = TRUE)))
+
+# Save pathway statistics
+saveRDS(pathway_stats_norm, file.path(getwd(), "pathway_stats_normalized.rds"))
+write.csv(
+  pathway_stats_norm,
+  file.path(getwd(), "pathway_stats_normalized.csv"),
+  row.names = FALSE
+)
+message("Saved: pathway_stats_normalized.rds and .csv")
+
+
+```
+
+## Violin plots for key inflammatory and interferon pathways
+
+```{r pathway_violin, message=FALSE, warning=FALSE, fig.width=14, fig.height=10}
+message("\n=== Creating Violin Plots for Key Inflammatory Pathways ===")
+
+
+# 1. Define key pathways organized by biological theme (matching manuscript text)
+key_pathways <- list(
+  # === UPREGULATED IN GFP+ (Inflammatory Activation & Stress Adaptation) ===
+  
+  # Pro Inflammatory Signaling
+  "TNF-α signaling\nvia NF-κB" = "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "AP-1 Transcription\nFactor Complex" = "GOCC_TRANSCRIPTION_FACTOR_AP_1_COMPLEX",
+  "LPS Response\n(NF-κB)" = "GSE14769_UNSTIM_VS_40MIN_LPS_BMDM_DN",
+
+  # Anti Inflammatory Signaling
+  "Response to\ncAMP" = "GOBP_RESPONSE_TO_CAMP",
+  "Response to\nCorticosterone" = "GOBP_RESPONSE_TO_CORTICOSTERONE",
+  
+  # MyD88-Independent TLR4/TICAM1 Pathway (Gram-negative sensing)
+  "MyD88-Independent\nTLR4 Cascade" = "REACTOME_MYD88_INDEPENDENT_TLR4_CASCADE",
+  "TICAM1-Mediated\nIRF3/IRF7 Activation" = "REACTOME_TICAM1_DEPENDENT_ACTIVATION_OF_IRF3_IRF7",
+  
+  # Stress Response & Adaptation
+  "Integrated Stress\nResponse (ISR)" = "GOBP_INTEGRATED_STRESS_RESPONSE_SIGNALING",
+  "Response to\nStarvation" = "GOBP_RESPONSE_TO_STARVATION",
+  
+  # Cell Trafficking
+  "C-C Chemokine\nBinding" = "GOMF_C_C_CHEMOKINE_BINDING",
+  "Negative Regulation\nof Monocyte Recruitment" = "GOBP_NEGATIVE_REGULATION_OF_MONOCYTE_CHEMOTAXIS",
+  
+  # === DOWNREGULATED IN GFP+ (Metabolic Shutdown & Homeostatic Loss) ===
+  
+  # Mitochondrial Collapse / OXPHOS
+  "Mitochondrial\nResp. Chain" = "HP_MITOCHONDRIAL_RESPIRATORY_CHAIN_DEFECTS",
+  "Cytochrome c\nOxidase Activity" = "GOBP_MITOCHONDRIAL_ELECTRON_TRANSPORT_CYTOCHROME_C_TO_OXYGEN",
+  "Cristae\nFormation" = "REACTOME_CRISTAE_FORMATION",
+  "Oxidative\nPhosphorylation" = "GOBP_OXIDATIVE_PHOSPHORYLATION",
+  
+  # Protein Synthesis / Ribosome
+  "Translational\nElongation" = "GOBP_TRANSLATIONAL_ELONGATION",
+  "Ribosome" = "GOCC_RIBOSOME",
+  
+  # Homeostatic/Lipid Functions (Lipid Scavenging Loss)
+  "Cholesterol\nEfflux" = "GOBP_POSITIVE_REGULATION_OF_CHOLESTEROL_EFFLUX",
+  "Foam Cell\nDifferentiation" = "HP_FOAM_CELLS",
+  
+  # RNA Processing Shutdown
+  "RNA Splicing\nRegulation" = "GOBP_NEGATIVE_REGULATION_OF_RNA_SPLICING"
+)
+
+# Save key_pathways mapping as CSV
+key_pathways_df <- data.frame(
+  display_name = names(key_pathways),
+  pathway_id = unlist(key_pathways),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    # Remove newline characters from display names
+    display_name = gsub("\\n", " ", display_name),
+    # Extract dataset origin from pathway ID prefix
+    dataset = case_when(
+      grepl("^HALLMARK_", pathway_id) ~ "MSigDB Hallmark",
+      grepl("^GOBP_", pathway_id) ~ "Gene Ontology - Biological Process",
+      grepl("^GOCC_", pathway_id) ~ "Gene Ontology - Cellular Component",
+      grepl("^GOMF_", pathway_id) ~ "Gene Ontology - Molecular Function",
+      grepl("^REACTOME_", pathway_id) ~ "Reactome",
+      grepl("^HP_", pathway_id) ~ "Human Phenotype Ontology",
+      grepl("^GSE", pathway_id) ~ "ImmuneSigDB (GEO dataset)",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  select(display_name, pathway_id, dataset)
+
+write.csv(
+  key_pathways_df,
+  file.path(fig_dir, "key_pathways_mapping.csv"),
+  row.names = FALSE
+)
+message(sprintf("Saved pathway mapping: %s", file.path(fig_dir, "key_pathways_mapping.csv")))
+
+# 2. Extract and Prepare Data
+violin_data <- pathway_results %>%
+  filter(pathway %in% key_pathways) %>%
+  mutate(
+    pathway_label = names(key_pathways)[match(pathway, key_pathways)],
+    group = dplyr::recode(group, gfp_score = "GFP+", control_score = "Control")
+  ) %>%
+  unnest(score_norm) %>%
+  filter(!is.na(score_norm))
+
+# 3. Prepare Statistics with Stars
+pathway_stats_subset <- pathway_stats_norm %>%
+  filter(pathway %in% key_pathways) %>%
+  mutate(
+    pathway_label = names(key_pathways)[match(pathway, key_pathways)],
+    direction = ifelse(effect_size > 0, "Upregulated in GFP+", "Downregulated in GFP+"),
+    # Create Asterisk Labels
+    p_star = case_when(
+      p_adj < 0.0001 ~ "****",
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01 ~ "**",
+      p_adj < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+# Define biological categories for better organization
+pathway_categories <- tibble::tribble(
+  ~pathway_label, ~category, ~category_order,
+  # Upregulated - Pro Inflammatory Signaling
+  "TNF-α signaling\nvia NF-κB", "Pro-Inflammatory\nSignaling", 1,
+  "AP-1 Transcription\nFactor Complex", "Pro-Inflammatory\nSignaling", 1,
+  "LPS Response\n(NF-κB)", "Pro-Inflammatory\nSignaling", 1,
+  # Upregulated - Anti Inflammatory Signaling
+  "Response to\ncAMP", "Anti-Inflammatory\nSignaling", 2,
+  "Response to\nCorticosterone", "Anti-Inflammatory\nSignaling", 2,
+  # Upregulated - TLR4/TICAM1 Pathway
+  "MyD88-Independent\nTLR4 Cascade", "TLR4-Mediated\nInterferon Signaling", 3,
+  "TICAM1-Mediated\nIRF3/IRF7 Activation", "TLR4-Mediated\nInterferon Signaling", 3,
+  # Upregulated - Stress Response & Adaptation
+  "Integrated Stress\nResponse (ISR)", "Stress Response\n& Adaptation", 4,
+  "Response to\nStarvation", "Stress Response\n& Adaptation", 4,
+  # Upregulated - Cell Trafficking
+  "C-C Chemokine\nBinding", "Chemotactic\nSignaling", 5,
+  "Negative Regulation\nof Monocyte Recruitment", "Chemotactic\nSignaling", 5,
+  # Downregulated - Mitochondrial Collapse / OXPHOS
+  "Mitochondrial\nResp. Chain", "Mitochondrial\nDysfunction", 6,
+  "Cytochrome c\nOxidase Activity", "Mitochondrial\nDysfunction", 6,
+  "Cristae\nFormation", "Mitochondrial\nDysfunction", 6,
+  "Oxidative\nPhosphorylation", "Mitochondrial\nDysfunction", 6,
+  # Downregulated - Protein Synthesis / Ribosome
+  "Translational\nElongation", "Protein Synthesis\nShutdown", 7,
+  "Ribosome", "Protein Synthesis\nShutdown", 7,
+  # Downregulated - Homeostatic/Lipid Functions
+  "Cholesterol\nEfflux", "Homeostatic/Lipid\nFunctions", 8,
+  "Foam Cell\nDifferentiation", "Homeostatic/Lipid\nFunctions", 8,
+  # Downregulated - RNA Processing Shutdown
+  "RNA Splicing\nRegulation", "RNA Processing\nShutdown", 9
+)
+
+# Set Factor Levels based on biological categories and effect size
+violin_data <- violin_data %>%
+  left_join(pathway_stats_subset %>% select(pathway_label, direction, effect_size), by = "pathway_label") %>%
+  left_join(pathway_categories, by = "pathway_label") %>%
+  filter(!is.na(category)) %>%  # Remove pathways without category mapping
+
+  mutate(
+    category = factor(category, levels = c(
+      "Pro-Inflammatory\nSignaling", "Anti-Inflammatory\nSignaling", "TLR4-Mediated\nInterferon Signaling", 
+      "Stress Response\n& Adaptation", "Chemotactic\nSignaling", 
+      "Mitochondrial\nDysfunction", "Protein Synthesis\nShutdown", "Homeostatic/Lipid\nFunctions", "RNA Processing\nShutdown"
+    )),
+    pathway_label = factor(pathway_label, 
+                           levels = pathway_stats_subset %>% 
+                             left_join(pathway_categories, by = "pathway_label") %>%
+                             filter(!is.na(category)) %>%
+                             arrange(category_order, desc(effect_size)) %>% 
+                             pull(pathway_label))
+  )
+
+# 4. Create Annotation Dataframe (Dynamic Positioning)
+annotation_df <- pathway_stats_subset %>%
+  left_join(pathway_categories, by = "pathway_label") %>%
+  filter(!is.na(category)) %>%  # Remove pathways without category mapping
+  mutate(
+    category = factor(category, levels = c(
+      "Pro-Inflammatory\nSignaling", "Anti-Inflammatory\nSignaling", "TLR4-Mediated\nInterferon Signaling", 
+      "Stress Response\n& Adaptation", "Chemotactic\nSignaling", 
+      "Mitochondrial\nDysfunction", "Protein Synthesis\nShutdown", "Homeostatic/Lipid\nFunctions", "RNA Processing\nShutdown"
+    )),
+    y_pos = sapply(pathway_label, function(p) {
+      vals <- violin_data$score_norm[violin_data$pathway_label == p]
+      if (length(vals) == 0 || all(is.na(vals))) return(0.5)
+      max(vals, na.rm = TRUE) + 0.4
+    }),
+    # Round effect size to 2 decimal places for display
+    effect_size_label = sprintf("%.2f", effect_size)
+  )
+
+# 5. Generate Two-Row Plot using patchwork
+# Separate data for up and down regulated
+up_categories <- c("Pro-Inflammatory\nSignaling", "Anti-Inflammatory\nSignaling", "TLR4-Mediated\nInterferon Signaling", 
+                   "Stress Response\n& Adaptation", "Chemotactic\nSignaling")
+down_categories <- c("Mitochondrial\nDysfunction", "Protein Synthesis\nShutdown", "Homeostatic/Lipid\nFunctions", "RNA Processing\nShutdown")
+
+violin_up <- violin_data %>% filter(category %in% up_categories)
+violin_down <- violin_data %>% filter(category %in% down_categories)
+
+annotation_up <- annotation_df %>% filter(category %in% up_categories)
+annotation_down <- annotation_df %>% filter(category %in% down_categories)
+
+# Common theme
+common_theme <- theme_classic(base_size = 20) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 16),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    strip.text = element_text(face = "bold", size = 14),
+    strip.clip = "off",
+    legend.position = "none",
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.2),
+    panel.spacing = unit(0.8, "lines")
+  )
+
+
+violin_up <- violin_up %>%
+  group_by(pathway_label) %>%
+  ungroup()
+
+violin_down <- violin_down %>%
+  group_by(pathway_label) %>%
+  ungroup()
+
+# Recalculate y_pos after clipping
+annotation_up <- annotation_up %>%
+  mutate(
+    y_pos = sapply(pathway_label, function(p) {
+      vals <- violin_up$score_norm[violin_up$pathway_label == p]
+      if (length(vals) == 0 || all(is.na(vals))) return(0.5)
+      max(vals, na.rm = TRUE) + 0.4
+    })
+  )
+
+annotation_down <- annotation_down %>%
+  mutate(
+    y_pos = sapply(pathway_label, function(p) {
+      vals <- violin_down$score_norm[violin_down$pathway_label == p]
+      if (length(vals) == 0 || all(is.na(vals))) return(0.5)
+      max(vals, na.rm = TRUE) + 0.4
+    })
+  )
+
+# Plot 1: Upregulated pathways
+p_up <- ggplot(violin_up, aes(x = pathway_label, y = score_norm, fill = group)) +
+  geom_violin(trim = FALSE, scale = "width", alpha = 0.7, position = position_dodge(width = 0.9)) +
+  geom_boxplot(width = 0.15, alpha = 0.8, position = position_dodge(width = 0.9), outlier.shape = NA) +
+  facet_grid(. ~ category, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("GFP+" = "#008B00", "Control" = "#949290ff"), name = "") +
+  geom_text(
+    data = annotation_up,
+    aes(x = pathway_label, y = y_pos + 0.6, label = effect_size_label),
+    inherit.aes = FALSE, size = 6, fontface = "bold", vjust = 0.5
+  ) +
+  geom_text(
+    data = annotation_up,
+    aes(x = pathway_label, y = y_pos, label = p_star),
+    inherit.aes = FALSE, size = 7, fontface = "bold", vjust = 0.5
+  ) +
+  labs(
+    subtitle = "Upregulated in GFP+",
+    y = "Enrichment Score",
+    x = NULL
+  ) +
+  common_theme +
+  theme(
+    plot.subtitle = element_text(hjust = 0.5, size = 18, face = "bold", color = "#006400"),
+    legend.position = "none"
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.3)
+
+# Plot 2: Downregulated pathways
+p_down <- ggplot(violin_down, aes(x = pathway_label, y = score_norm, fill = group)) +
+  geom_violin(trim = FALSE, scale = "width", alpha = 0.7, position = position_dodge(width = 0.9)) +
+  geom_boxplot(width = 0.15, alpha = 0.8, position = position_dodge(width = 0.9), outlier.shape = NA) +
+  facet_grid(. ~ category, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("GFP+" = "#008B00", "Control" = "#949290ff"), name = "") +
+  geom_text(
+    data = annotation_down,
+    aes(x = pathway_label, y = y_pos + 0.6, label = effect_size_label),
+    inherit.aes = FALSE, size = 6, fontface = "bold", vjust = 0.5
+  ) +
+  geom_text(
+    data = annotation_down,
+    aes(x = pathway_label, y = y_pos, label = p_star),
+    inherit.aes = FALSE, size = 7, fontface = "bold", vjust = 0.5
+  ) +
+  labs(
+    subtitle = "Downregulated in GFP+",
+    y = "Enrichment Score",
+    x = NULL
+  ) +
+  common_theme +
+  theme(
+    plot.subtitle = element_text(hjust = 0.5, size = 18, face = "bold", color = "#8B0000"),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.box.background = element_blank(),
+    legend.text = element_text(size = 16)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.3)
+
+# Combine with patchwork
+p_violin <- p_up / p_down +
+  plot_annotation(
+    title = "",
+    subtitle = "",
+    theme = theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey30")
+    )
+  )
+
+print(p_violin)
+
+# Print statistics table
+message("\n=== Pathway Statistics ===")
+pathway_stats_display <- pathway_stats_subset %>% 
+  left_join(pathway_categories, by = "pathway_label") %>%
+  arrange(category_order, desc(effect_size)) %>%
+  select(category, pathway_label, effect_size, p_adj) %>%
+  mutate(
+    effect_size = round(effect_size, 3),
+    p_adj = format(p_adj, scientific = TRUE, digits = 3),
+    direction = ifelse(effect_size > 0, "↑ GFP+", "↓ GFP+")
+  )
+
+print(pathway_stats_display)
+
+# Save statistics table as CSV
+write.csv(
+  pathway_stats_display,
+  file.path(getwd(), "pathway_violin_statistics.csv"),
+  row.names = FALSE
+)
+message("Saved: pathway_violin_statistics.csv")
+
+# Save violin plot
+message("\nSaving violin plot...")
+ggsave(
+  filename = file.path(fig_dir, "Figure_pathway_violin_inflammatory.pdf"),
+  plot = p_violin,
+  width = 14,
+  height = 10,
+  dpi = 300
+)
+message("Saved: figures/Figure_pathway_violin_inflammatory.pdf")
+
+ggsave(
+  filename = file.path(fig_dir, "Figure_pathway_violin_inflammatory.png"),
+  plot = p_violin,
+  width = 14,
+  height = 10,
+  dpi = 300,
+  bg = "white"
+)
+message("Saved: figures/Figure_pathway_violin_inflammatory.png")
+```
+
+#  Enrichment Map Plot (emapplot)
+
+```{r pathway_emap, message=FALSE, warning=FALSE, fig.width=14, fig.height=12}
+message("\n=== Creating Enrichment Map Plot for Key Pathways ===")
+
+# Load required packages
+library(enrichplot)
+
+# Get pathway IDs from key_pathways
+pathway_ids <- unname(unlist(key_pathways))
+pathway_labels <- names(key_pathways)
+
+# Get statistics for these pathways
+emap_stats <- pathway_stats_norm %>%
+  filter(pathway %in% pathway_ids) %>%
+  mutate(
+    pathway_label = names(key_pathways)[match(pathway, key_pathways)]
+  ) %>%
+  arrange(p_adj)
+
+# Get gene sets for these pathways
+emap_gene_sets <- gene_sets[names(gene_sets) %in% pathway_ids]
+
+# Create geneID column (genes separated by "/")
+geneID_list <- sapply(emap_stats$pathway, function(pw) {
+  genes <- emap_gene_sets[[pw]]
+  if (is.null(genes)) return("")
+  paste(genes, collapse = "/")
+})
+
+# Build the result data frame required by enrichResult
+result_df <- data.frame(
+  ID = emap_stats$pathway,
+  Description = emap_stats$pathway_label,
+  GeneRatio = paste0(sapply(emap_stats$pathway, function(pw) length(emap_gene_sets[[pw]])), "/1000"),
+  BgRatio = "1000/20000",
+  pvalue = emap_stats$p_value,
+  p.adjust = emap_stats$p_adj,
+  qvalue = emap_stats$p_adj,
+  geneID = geneID_list,
+  Count = sapply(emap_stats$pathway, function(pw) length(emap_gene_sets[[pw]])),
+  stringsAsFactors = FALSE
+)
+
+# Create enrichResult S4 object
+enrichResult_custom <- new("enrichResult",
+  result = result_df,
+  pvalueCutoff = 1,
+  pAdjustMethod = "fdr",
+  qvalueCutoff = 1,
+  organism = "Mus musculus",
+  ontology = "CUSTOM",
+  gene = unique(unlist(emap_gene_sets)),
+  keytype = "SYMBOL",
+  universe = character(0),
+  geneSets = emap_gene_sets,
+  readable = FALSE
+)
+
+# Calculate pairwise term similarity using Jaccard coefficient
+enrichResult_custom <- pairwise_termsim(enrichResult_custom, method = "JC")
+
+# Create emapplot with lower similarity cutoff to show more edges
+p_emap <- emapplot(enrichResult_custom, 
+                   showCategory = 20,
+                   layout = "kk",
+                   min_edge = 0.05) +  # Lower threshold to show more connections
+  labs(
+    title = "Pathway Enrichment Network",
+    subtitle = "Key inflammatory and metabolic pathways - edges show gene set overlap (Jaccard ≥ 0.05)"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey40"),
+    legend.title = element_text(face = "bold", size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+print(p_emap)
+
+# ============================================================================
+# Publication-ready version with manual customization and category grouping
+# ============================================================================
+
+# Extract network data from the enrichResult object for custom plotting
+sim_matrix <- enrichResult_custom@termsim
+result_df <- enrichResult_custom@result
+
+# Create node data
+node_data <- result_df %>%
+  mutate(
+    effect_size = emap_stats$effect_size[match(ID, emap_stats$pathway)],
+    direction = ifelse(effect_size > 0, "Upregulated\nin GFP+", "Downregulated\nin GFP+"),
+    neg_log_padj = -log10(p.adjust),
+    # Clean up labels for publication (remove \n)
+    label_clean = gsub("\n", " ", Description)
+  ) %>%
+  # Add category information
+  left_join(pathway_categories, by = c("Description" = "pathway_label"))
+
+# Create edge list from similarity matrix
+edge_list <- data.frame()
+for (i in 1:(nrow(sim_matrix)-1)) {
+  for (j in (i+1):ncol(sim_matrix)) {
+    sim_val <- sim_matrix[i, j]
+    if (!is.na(sim_val) && sim_val >= 0.05) {
+      edge_list <- rbind(edge_list, data.frame(
+        from = rownames(sim_matrix)[i],
+        to = colnames(sim_matrix)[j],
+        similarity = sim_val
+      ))
+    }
+  }
+}
+
+# Create igraph object for layout
+library(igraph)
+g <- graph_from_data_frame(edge_list, directed = FALSE, vertices = node_data$Description)
+
+# Use graph layout for connected nodes
+set.seed(789)
+layout_coords <- layout_with_graphopt(g, niter = 1500, charge = 0.02, spring.length = 8)
+colnames(layout_coords) <- c("x", "y")
+
+# Add coordinates to node data
+node_data$x <- layout_coords[match(node_data$Description, V(g)$name), 1]
+node_data$y <- layout_coords[match(node_data$Description, V(g)$name), 2]
+
+# For isolated nodes (not connected to the graph), place them scattered
+isolated <- is.na(node_data$x)
+if (any(isolated)) {
+  n_isolated <- sum(isolated)
+  x_range <- range(node_data$x, na.rm = TRUE)
+  y_range <- range(node_data$y, na.rm = TRUE)
+  
+  set.seed(456)
+  node_data$x[isolated] <- runif(n_isolated, x_range[1] - 2, x_range[2] + 2)
+  node_data$y[isolated] <- runif(n_isolated, y_range[1] - 1, y_range[2] + 1)
+}
+
+# Create edge coordinates
+edge_coords <- edge_list %>%
+  left_join(node_data %>% select(Description, x, y), by = c("from" = "Description")) %>%
+  dplyr::rename(x_from = x, y_from = y) %>%
+  left_join(node_data %>% select(Description, x, y), by = c("to" = "Description")) %>%
+  dplyr::rename(x_to = x, y_to = y)
+
+# Define colors for each category
+category_colors <- c(
+  "Pro-Inflammatory\nSignaling" = "#E41A1C",          # Bright red
+  "Anti-Inflammatory\nSignaling" = "#FF7F00",        # Orange
+  "TLR4-Mediated\nInterferon Signaling" = "#FFFF33", # Yellow
+  "Stress Response\n& Adaptation" = "#A65628",       # Brown
+  "Chemotactic\nSignaling" = "#F781BF",              # Pink
+  "Mitochondrial\nDysfunction" = "#4DAF4A",          # Green
+  "Protein Synthesis\nShutdown" = "#377EB8",         # Blue
+  "Homeostatic/Lipid\nFunctions" = "#984EA3",        # Purple
+  "RNA Processing\nShutdown" = "#00CED1"             # Cyan
+)
+
+# Publication-ready plot with category-colored borders
+p_emap_pub <- ggplot() +
+  # Draw edges first
+  geom_segment(
+    data = edge_coords,
+    aes(x = x_from, y = y_from, xend = x_to, yend = y_to, 
+        linewidth = similarity),
+    color = "grey55",
+    alpha = 0.5
+  ) +
+  # Draw nodes with category-colored borders
+  geom_point(
+    data = node_data,
+    aes(x = x, y = y, size = Count, fill = effect_size, color = category),
+    shape = 21, stroke = 1.8
+  ) +
+  geom_point(
+    data = node_data,
+    aes(x = x, y = y, size = Count, fill = effect_size),
+    shape = 21, color = "grey30", stroke = 0.3
+  ) +
+  # Add labels with repulsion
+  ggrepel::geom_text_repel(
+    data = node_data,
+    aes(x = x, y = y, label = label_clean),
+    size = 3.5,
+    color = "grey10",
+    fontface = "bold",
+    box.padding = 0.5,
+    point.padding = 0.3,
+    segment.color = "grey65",
+    segment.size = 0.25,
+    segment.alpha = 0.5,
+    max.overlaps = 30,
+    force = 3,
+    force_pull = 0.2,
+    min.segment.length = 0,
+    seed = 42
+  ) +
+  # Color scale for effect size
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "#F7F7F7", 
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Effect Size\n(GFP+ vs Control)",
+    limits = c(-1.5, 1.5),
+    breaks = c(-1.5, -1, -0.5, 0, 0.5, 1, 1.5),
+    guide = guide_colorbar(
+      barwidth = 0.8,
+      barheight = 5,
+      title.position = "top",
+      title.hjust = 0.5,
+      frame.colour = "grey40",
+      ticks.colour = "grey40",
+      order = 1
+    )
+  ) +
+  # Category colors for borders
+  scale_color_manual(
+    values = category_colors,
+    name = "Pathway\nCategory",
+    guide = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      override.aes = list(size = 5, fill = "white", stroke = 1.5),
+      order = 3
+    )
+  ) +
+  # Size scale
+  scale_size_continuous(
+    name = "Gene Set\nSize",
+    range = c(4, 15),
+    breaks = c(25, 75, 125, 175),
+    guide = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      override.aes = list(fill = "grey70", color = "grey30", stroke = 0.5),
+      order = 2
+    )
+  ) +
+  # Edge width
+  scale_linewidth_continuous(
+    range = c(0.3, 2),
+    guide = "none"
+  ) +
+  # Labels
+  labs(
+    title = "Pathway Enrichment Network",
+    subtitle = ""
+  ) +
+  # Theme
+  theme_void(base_size = 10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 13, 
+                              margin = margin(b = 2)),
+    plot.subtitle = element_text(hjust = 0.5, size = 9, color = "grey35",
+                                  margin = margin(b = 8)),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.spacing.y = unit(0.4, "cm"),
+    legend.title = element_text(face = "bold", size = 8),
+    legend.text = element_text(size = 7),
+    plot.margin = margin(8, 8, 8, 8),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_emap_pub)
+
+# Save the publication-ready plot
+ggsave(
+  filename = file.path(fig_dir, "Figure_pathway_emap.pdf"),
+  plot = p_emap_pub,
+  width = 12,
+  height = 9,
+  dpi = 300
+)
+message("Saved: ", file.path(fig_dir, "Figure_pathway_emap.pdf"))
+
+ggsave(
+  filename = file.path(fig_dir, "Figure_pathway_emap.png"),
+  plot = p_emap_pub,
+  width = 12,
+  height = 9,
+  dpi = 300,
+  bg = "white"
+)
+message("Saved: ", file.path(fig_dir, "Figure_pathway_emap.png"))
+```
+
+
+## Define characteristic pathway groups
+
+```{r pathway_definitions, message=FALSE, warning=FALSE}
+message("\n=== Defining Characteristic Pathway Groups ===")
+
+# 1. Innate Immune and Inflammatory Response - microbial recognition
+innate_immune <- c(
+  "GOBP_TOLL_LIKE_RECEPTOR_4_SIGNALING_PATHWAY",
+  "GOBP_NUCLEOTIDE_BINDING_OLIGOMERIZATION_DOMAIN_CONTAINING_1_SIGNALING_PATHWAY",
+  "GOBP_CELL_SURFACE_PATTERN_RECOGNITION_RECEPTOR_SIGNALING_PATHWAY",
+  "REACTOME_DDX58_IFIH1_MEDIATED_INDUCTION_OF_INTERFERON_ALPHA_BETA",
+  "KEGG_NOD_LIKE_RECEPTOR_SIGNALING_PATHWAY",
+  "KEGG_TOLL_LIKE_RECEPTOR_SIGNALING_PATHWAY",
+  "KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY",
+  "REACTOME_INTERLEUKIN_1_SIGNALING",
+  "REACTOME_INTERLEUKIN_1_FAMILY_SIGNALING",
+  "GOBP_REGULATION_OF_TOLL_LIKE_RECEPTOR_4_SIGNALING_PATHWAY",
+  "GOBP_RESPONSE_TO_MOLECULE_OF_BACTERIAL_ORIGIN",
+  "GOBP_RESPONSE_TO_MURAMYL_DIPEPTIDE",
+  "GOBP_NUCLEOTIDE_BINDING_DOMAIN_LEUCINE_RICH_REPEAT_CONTAINING_RECEPTOR_SIGNALING_PATHWAY",
+  "GOBP_INNATE_IMMUNE_RESPONSE_ACTIVATING_CELL_SURFACE_RECEPTOR_SIGNALING_PATHWAY",
+  "REACTOME_TOLL_LIKE_RECEPTOR_9_TLR9_CASCADE",
+  "REACTOME_TOLL_LIKE_RECEPTOR_TLR1_TLR2_CASCADE",
+  "REACTOME_MYD88_INDEPENDENT_TLR4_CASCADE",
+  "GOMF_LIPOPOLYSACCHARIDE_BINDING"
+)
+
+# 2. Pro-inflammatory Polarization (M1-like)
+pro_inf_mac <- c(
+  "GSE5099_MONOCYTE_VS_ALTERNATIVE_M2_MACROPHAGE_DN",
+  "GSE16385_UNTREATED_VS_12H_IFNG_TNF_TREATED_MACROPHAGE_DN",
+  "GSE16385_UNTREATED_VS_12H_ROSIGLITAZONE_IFNG_TNF_TREATED_MACROPHAGE_UP",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "GSE10500_ARTHRITIC_SYNOVIAL_FLUID_VS_HEALTHY_MACROPHAGE_UP",
+  "REACTOME_NF_KB_IS_ACTIVATED_AND_SIGNALS_SURVIVAL",
+  "GOBP_NEGATIVE_REGULATION_OF_CANONICAL_NF_KAPPAB_SIGNAL_TRANSDUCTION",
+  "GOBP_NEGATIVE_REGULATION_OF_NF_KAPPAB_TRANSCRIPTION_FACTOR_ACTIVITY",
+  "GOBP_CYTOPLASMIC_SEQUESTERING_OF_NF_KAPPAB",
+  "GOMF_NF_KAPPAB_BINDING",
+  "GOBP_CHRONIC_INFLAMMATORY_RESPONSE",
+  "GOBP_REGULATION_OF_CHRONIC_INFLAMMATORY_RESPONSE",
+  "REACTOME_ACTIVATION_OF_THE_AP_1_FAMILY_OF_TRANSCRIPTION_FACTORS",
+  "GOCC_TRANSCRIPTION_FACTOR_AP_1_COMPLEX"
+)
+
+# 3. Autophagy and Phagosome Function
+autophagy_phagosome <- c(
+  "GOBP_AUTOPHAGOSOME_MATURATION",
+  "GOBP_POSITIVE_REGULATION_OF_MACROAUTOPHAGY",
+  "GOBP_REGULATION_OF_AUTOPHAGY",
+  "GOBP_POSITIVE_REGULATION_OF_AUTOPHAGY",
+  "GOBP_PHAGOSOME_LYSOSOME_FUSION",
+  "REACTOME_PEXOPHAGY",
+  "REACTOME_PREVENTION_OF_PHAGOSOMAL_LYSOSOMAL_FUSION",
+  "REACTOME_SUPPRESSION_OF_PHAGOSOMAL_MATURATION"
+)
+
+# 4. Metabolic Adaptation and Stress Response
+metabolic_stress <- c(
+  "GOBP_CELLULAR_RESPONSE_TO_STARVATION",
+  "GOBP_RESPONSE_TO_STARVATION",
+  "GOBP_RESPONSE_TO_AMINO_ACID_STARVATION",
+  "GOBP_CELLULAR_RESPONSE_TO_NUTRIENT_LEVELS",
+  "GOBP_INTEGRATED_STRESS_RESPONSE_SIGNALING",
+  "REACTOME_ATF4_ACTIVATES_GENES_IN_RESPONSE_TO_ENDOPLASMIC_RETICULUM_STRESS",
+  "HP_LACTIC_ACIDOSIS",
+  "HP_LACTICACIDURIA",
+  "HP_3_METHYLGLUTACONIC_ACIDURIA"
+)
+
+# 5. LPS Response
+lps_response <- c(
+  "GSE14000_UNSTIM_VS_16H_LPS_DC_DN",
+  "GSE14000_UNSTIM_VS_4H_LPS_DC_DN",
+  "GSE14769_UNSTIM_VS_120MIN_LPS_BMDM_DN",
+  "GSE14769_UNSTIM_VS_20MIN_LPS_BMDM_DN",
+  "GSE14769_UNSTIM_VS_40MIN_LPS_BMDM_DN",
+  "GSE14769_UNSTIM_VS_60MIN_LPS_BMDM_DN",
+  "GSE14769_UNSTIM_VS_80MIN_LPS_BMDM_DN",
+  "GSE17721_CTRL_VS_LPS_1H_BMDC_DN",
+  "GSE17721_CTRL_VS_LPS_24H_BMDC_DN",
+  "GSE17721_CTRL_VS_LPS_2H_BMDC_DN",
+  "GSE22935_UNSTIM_VS_24H_MBOVIS_BCG_STIM_MACROPHAGE_DN",
+  "GSE3982_CTRL_VS_LPS_48H_DC_DN",
+  "GSE3982_CTRL_VS_LPS_4H_MAC_DN",
+  "GSE7348_UNSTIM_VS_LPS_STIM_MACROPHAGE_DN",
+  "GSE9037_CTRL_VS_LPS_1H_STIM_BMDM_DN",
+  "GSE2706_UNSTIM_VS_2H_LPS_DC_DN",
+  "GSE2706_UNSTIM_VS_8H_LPS_DC_DN"
+)
+
+mitochondrial_dysfunction <- c(
+  "GOBP_ENERGY_COUPLED_PROTON_TRANSMEMBRANE_TRANSPORT_AGAINST_ELECTROCHEMICAL_GRADIENT",
+  "GOBP_MITOCHONDRIAL_ELECTRON_TRANSPORT_CYTOCHROME_C_TO_OXYGEN",
+  "GOCC_PROTON_TRANSPORTING_ATP_SYNTHASE_COMPLEX",
+  "GOMF_OXIDOREDUCTASE_ACTIVITY_ACTING_ON_A_HEME_GROUP_OF_DONORS",
+  "HP_MITOCHONDRIAL_RESPIRATORY_CHAIN_DEFECTS",
+  "HP_ABNORMAL_MITOCHONDRIA_IN_MUSCLE_TISSUE",
+  "HP_MITOCHONDRIAL_MYOPATHY",
+  "REACTOME_CRISTAE_FORMATION"
+)
+
+# Combine all into a single list
+all_characteristic_pathways <- list(
+  innate_immune = innate_immune,
+  pro_inf_mac = pro_inf_mac,
+  autophagy_phagosome = autophagy_phagosome,
+  metabolic_stress = metabolic_stress,
+  lps_response = lps_response,
+  mitochondrial_dysfunction = mitochondrial_dysfunction
+)
+
+message("\nDefined pathway groups:")
+for (group_name in names(all_characteristic_pathways)) {
+  n_pathways <- length(all_characteristic_pathways[[group_name]])
+  message(sprintf("  %s: %d pathways", group_name, n_pathways))
+}
+```
+
+
+
+## Waterfall plot of pathway enrichment
+
+```{r waterfall_plot, message=FALSE, warning=FALSE, fig.width=14, fig.height=10}
+message("\n=== Creating Waterfall Plot ===")
+
+# Prepare data for waterfall plot
+# Shows effect sizes for characteristic pathways grouped by category
+waterfall_data <- map_dfr(names(all_characteristic_pathways), function(category) {
+  pathways <- all_characteristic_pathways[[category]]
+  
+  # Get stats for these pathways
+  stats <- pathway_stats_norm %>%
+    filter(pathway %in% pathways) %>%
+    mutate(
+      category = category,
+      direction = ifelse(effect_size > 0, "GFP", "Control")
+    )
+  
+  stats
+}) %>%
+  arrange(category, desc(abs(effect_size))) %>%
+  mutate(
+    # Clean pathway names for display
+    pathway_label = str_remove(pathway, "^[A-Z]+_") %>% 
+      str_replace_all("_", " ") %>% 
+      str_to_title() %>%
+      str_trunc(50),
+    category_label = str_replace_all(category, "_", " ") %>% str_to_title(),
+    # Assign significance stars
+    significance = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01 ~ "**",
+      p_adj < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+message(sprintf("Prepared waterfall plot data: %d pathways", nrow(waterfall_data)))
+
+# Filter out overly long pathway name that clutters the plot
+waterfall_data <- waterfall_data |> 
+  filter(pathway != "GOBP_NUCLEOTIDE_BINDING_OLIGOMERIZATION_DOMAIN_CONTAINING_2_SIGNALING_PATHWAY")
+
+
+# Create waterfall plot
+p_waterfall <- ggplot(waterfall_data, aes(x = effect_size, y = reorder(pathway_label, effect_size))) +
+  geom_col(aes(fill = direction), width = 0.7) +
+  geom_text(
+    aes(label = significance, x = effect_size + sign(effect_size) * 0.05), 
+    size = 3, 
+    hjust = ifelse(waterfall_data$effect_size > 0, 0, 1)
+  ) +
+  facet_wrap(~ category_label, scales = "free_y", ncol = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.3) +
+  scale_fill_manual(
+    values = c("GFP" = "#a7c957", "Control" = "#bc4749"),
+    name = "Enriched in"
+  ) +
+  labs(
+    title = "Pathway Enrichment: GFP+ Maternal Cells vs Control",
+    subtitle = "Effect size with significance (* p<0.05, ** p<0.01, *** p<0.001)",
+    x = "Effect Size (Cohen's d)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    strip.text = element_text(face = "bold", size = 10),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+
+print(p_waterfall)
+
+# Save waterfall plot
+message("\nSaving waterfall plot...")
+ggsave(
+  filename = file.path(fig_dir, "Figure_pathway_waterfall.pdf"),
+  plot = p_waterfall,
+  width = 14,
+  height = 10,
+  dpi = 300
+)
+message("Saved: figures/Figure_pathway_waterfall.pdf")
+
+ggsave(
+  filename = file.path(fig_dir, "Figure_pathway_waterfall.png"),
+  plot = p_waterfall,
+  width = 14,
+  height = 10,
+  dpi = 300,
+  bg = "white"
+)
+message("Saved: figures/Figure_pathway_waterfall.png")
+```
+
+
+## Visualize pathway enrichment on UMAP
+
+```{r pathway_umap_function, message=FALSE, warning=FALSE}
+message("\n=== Preparing Pathway UMAP Visualizations ===")
+
+# Ensure UMAP is computed
+if (!"umap" %in% names(mac.srt@reductions)) {
+  message("Computing UMAP for pathway visualization...")
+  mac.srt <- RunUMAP(mac.srt, reduction = "pca", dims = MAC_PCA_DIMS, verbose = FALSE)
+}
+
+# Function to visualize pathway enrichment on UMAP
+# 
+# @param seurat_obj Seurat object with UMAP coordinates
+# @param pathway_name MSigDB pathway name to visualize
+# @param gene_name Single gene name to visualize (alternative to pathway)
+# @param max_rank Maximum rank for UCell scoring
+# @return ggplot object with UMAP colored by pathway/gene score
+plot_pathway_umap <- function(seurat_obj, pathway_name = NULL, gene_name = NULL, max_rank = 1000) {
+
+  if (!is.null(pathway_name)) {
+    # Score pathway using UCell
+    pathway_genes <- all_pathways[all_pathways$gs_name == pathway_name, "gene_symbol"] |> 
+      pull(gene_symbol)
+    genes_in_data <- intersect(pathway_genes, rownames(seurat_obj))
+    
+    if (length(genes_in_data) < 3) {
+      stop(sprintf("Insufficient genes in pathway: %d found", length(genes_in_data)))
+    }
+    
+    message(sprintf("Scoring pathway '%s' (%d genes)", pathway_name, length(genes_in_data)))
+    gene_set <- list(temp = genes_in_data)
+    seurat_obj <- AddModuleScore_UCell(
+      seurat_obj, 
+      features = gene_set, 
+      maxRank = max_rank, 
+      ncores = 30,
+      name = ""
+    )
+    score_col <- "temp_UCell"
+    plot_title <- str_remove(pathway_name, "^[A-Z]+_") %>% 
+      str_replace_all("_", " ") %>% 
+      str_trunc(60)
+    
+  } else if (!is.null(gene_name)) {
+    # Visualize single gene expression
+    if (!gene_name %in% rownames(seurat_obj)) {
+      stop(sprintf("Gene '%s' not found in dataset", gene_name))
+    }
+    message(sprintf("Plotting gene expression: %s", gene_name))
+    score_col <- gene_name
+    plot_title <- gene_name
+  } else {
+    stop("Must provide either pathway_name or gene_name")
+  }
+
+  # Extract scores
+  scores <- if (score_col %in% colnames(seurat_obj@meta.data)) {
+    seurat_obj@meta.data[[score_col]]
+  } else {
+    GetAssayData(seurat_obj, layer = "data")[gene_name, ]
+  }
+  
+  # Check for all NA values
+  if (all(is.na(scores))) {
+    stop(sprintf("All scores are NA for %s", ifelse(!is.null(pathway_name), pathway_name, gene_name)))
+  }
+  
+  # MAD normalization
+  med <- median(scores, na.rm = TRUE)
+  mad_val <- mad(scores, na.rm = TRUE)
+  scores_norm <- (scores - med) / (mad_val + 1e-9)
+  
+  # Cap extreme outliers at 1st and 99th percentiles
+  lower <- quantile(scores_norm, 0.01, na.rm = TRUE)
+  upper <- quantile(scores_norm, 0.99, na.rm = TRUE)
+  scores_capped <- pmax(pmin(scores_norm, upper), lower)
+  
+  seurat_obj$plot_score <- scores_capped
+  
+  # Create UMAP with viridis color scale
+  p <- FeaturePlot(
+    seurat_obj, 
+    features = "plot_score", 
+    reduction = "umap",
+    pt.size = 0.5
+  ) +
+    scale_color_gradientn(
+      colors = c("#440154", "#31688e", "#35b779", "#fde724"),
+      name = "Normalized\nScore"
+    ) +
+    labs(
+      title = plot_title,
+      subtitle = sprintf("n = %d genes", length(genes_in_data))
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 10)
+    )
+  
+  return(p)
+}
+
+
+```
+
+### LPS response pathways
+
+```{r pathway_umap_lps, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+message("\n=== Visualizing LPS Response Pathways ===")
+
+# Example 1: Early LPS response (40 min)
+p_lps1 <- plot_pathway_umap(
+  seurat_obj = mac.srt, 
+  pathway_name = "GSE14769_UNSTIM_VS_40MIN_LPS_BMDM_DN"
+)
+print(p_lps1)
+
+# Example 2: TLR4 signaling
+p_lps2 <- plot_pathway_umap(
+  seurat_obj = mac.srt, 
+  pathway_name = "GOBP_TOLL_LIKE_RECEPTOR_4_SIGNALING_PATHWAY"
+)
+print(p_lps2)
+```
+
+
+
+
+### Inflammatory signaling pathways
+
+```{r pathway_umap_inflammation, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+message("\n=== Visualizing Inflammatory Signaling Pathways ===")
+
+# TNF-alpha signaling via NF-kB
+p_tnf <- plot_pathway_umap(
+  seurat_obj = mac.srt, 
+  pathway_name = "HALLMARK_TNFA_SIGNALING_VIA_NFKB"
+)
+print(p_tnf)
+
+# AP-1 transcription factor complex
+p_ap1 <- plot_pathway_umap(
+  seurat_obj = mac.srt, 
+  pathway_name = "GOCC_TRANSCRIPTION_FACTOR_AP_1_COMPLEX"
+)
+print(p_ap1)
+```
+
+
+
+### Metabolic stress pathways
+
+```{r pathway_umap_stress, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+message("\n=== Visualizing Metabolic Stress Pathways ===")
+
+# Starvation response
+p_starv <- plot_pathway_umap(
+  seurat_obj = mac.srt, 
+  pathway_name = "GOBP_RESPONSE_TO_STARVATION"
+)
+print(p_starv)
+
+# Lactic acidosis
+p_lactic <- plot_pathway_umap(
+  seurat_obj = mac.srt, 
+  pathway_name = "HP_LACTIC_ACIDOSIS"
+)
+print(p_lactic)
+```
+
