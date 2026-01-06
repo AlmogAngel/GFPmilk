@@ -1,10 +1,10 @@
-# GFP+ Maternal Cells in Puppy Blood: Single-Cell RNA-seq Analysis
+# Maternal Cell Transfer via Milk: Single-Cell RNA-seq Analysis
 
-This repository contains the analysis code and documentation for our study investigating GFP+ maternal cells detected in puppy blood samples.
+This repository contains the analysis code and documentation for single-cell RNA-seq analysis of maternal cells transferred through milk to nursing pups.
 
 ## Overview
 
-This project analyzes single-cell RNA-seq data from mouse blood samples comparing GFP+ experimental conditions to control samples. The analysis identifies and characterizes maternal cells that cross the placental barrier and persist in offspring circulation.
+This project analyzes single-cell RNA-seq data from mouse pup blood samples to identify and characterize maternal cells transferred via nursing. Using GFP-labeled maternal cells, we track and analyze transferred immune cells in the offspring circulation, focusing on macrophage populations and their transcriptional signatures.
 
 ## Repository Contents
 
@@ -17,9 +17,10 @@ This project analyzes single-cell RNA-seq data from mouse blood samples comparin
 
 ## Key Findings
 
-- Detection of GFP+ maternal cells in puppy blood samples
-- Characterization of macrophage populations
-- Differential gene expression and pathway analysis between GFP+ and control samples
+- Identification of maternal cells transferred via milk in nursing pup blood
+- Characterization of transferred macrophage populations  
+- Differential gene expression and pathway analysis of maternal vs. control cells
+- Evidence of maternal immune cell transfer through lactation
 
 ## Analysis Workflow
 
